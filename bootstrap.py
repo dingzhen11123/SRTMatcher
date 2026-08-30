@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -13,7 +14,8 @@ from pathlib import Path
 
 
 APP_NAME = "SRTMatcher"
-APP_BUILD_ID = "2026-07-06-whisperx-window-upgrade"
+DISPLAY_NAME = "字幕多功能工具"
+APP_BUILD_ID = "2026-08-31-logo-c-shortcut-fix"
 DEFAULT_APP_HOME = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 APP_HOME = DEFAULT_APP_HOME
 APP_DIR = APP_HOME / "app"
@@ -22,7 +24,20 @@ VENV_DIR = APP_HOME / ".venv"
 UV_EXE = TOOLS_DIR / "uv.exe"
 READY_FILE = APP_HOME / ".runtime-ready"
 UV_URL = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
-SOURCE_FILES = ["app.py", "qt_app.py", "requirements.txt", "README.md"]
+SOURCE_FILES = [
+    "app.py",
+    "qt_app.py",
+    "task_runtime.py",
+    "model_runtime.py",
+    "ai_transport.py",
+    "asr_runtime.py",
+    "batch_runtime.py",
+    "requirements.txt",
+    "README.md",
+    "FFMPEG-NOTICE.txt",
+    "srtmatcher-logo.png",
+    "srtmatcher.ico",
+]
 PROGRESS_UI = None
 INSTALLED_EXE_NAME = "SRTMatcher.exe"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
@@ -36,6 +51,12 @@ class ProgressUI:
         self.tk = tk
         self.root = tk.Tk()
         self.root.title("SRTMatcher 安装")
+        try:
+            icon_path = source_root() / "srtmatcher.ico"
+            if icon_path.exists():
+                self.root.iconbitmap(default=str(icon_path))
+        except Exception:
+            pass
         self.root.geometry("640x420")
         self.root.minsize(560, 360)
         self.root.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -202,6 +223,26 @@ def source_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def source_bundle_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for name in SOURCE_FILES:
+        path = root / name
+        digest.update(name.encode("utf-8"))
+        if not path.exists():
+            digest.update(b"\0missing\0")
+            continue
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def runtime_build_id() -> str:
+    return f"{APP_BUILD_ID}:{source_bundle_hash(source_root())}"
+
+
 def run(args: list[str], cwd: Path | None = None, progress_value: float | None = None, status: str | None = None) -> None:
     if status is not None:
         show_progress(progress_value if progress_value is not None else 0, status)
@@ -270,7 +311,10 @@ def install_sources() -> None:
     for name in SOURCE_FILES:
         source = root / name
         if source.exists():
-            shutil.copy2(source, APP_DIR / name)
+            target = APP_DIR / name
+            temp_target = target.with_name(f".{target.name}.upgrade.tmp")
+            retry_file_action(lambda: shutil.copy2(source, temp_target), f"复制 {name}")
+            retry_file_action(lambda: os.replace(temp_target, target), f"更新 {name}")
 
 
 def ensure_uv() -> None:
@@ -336,7 +380,12 @@ def main_app_ready() -> bool:
     if not python.exists():
         return False
     check = subprocess.run(
-        [str(python), "-c", "import PySide6, faster_whisper, huggingface_hub"],
+        [
+            str(python),
+            "-c",
+            "import PySide6, faster_whisper, huggingface_hub, httpx; "
+            "import task_runtime, model_runtime, ai_transport, asr_runtime, batch_runtime",
+        ],
         cwd=str(APP_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -358,11 +407,14 @@ def runtime_marker_ready() -> bool:
         marker = READY_FILE.read_text(encoding="utf-8").splitlines()[0].strip()
     except Exception:
         return False
-    return marker == APP_BUILD_ID
+    expected_id = runtime_build_id()
+    if marker != expected_id:
+        return False
+    return source_bundle_hash(APP_DIR) == source_bundle_hash(source_root())
 
 
 def write_runtime_marker() -> None:
-    READY_FILE.write_text(f"{APP_BUILD_ID}\n{int(time.time())}\n", encoding="utf-8")
+    READY_FILE.write_text(f"{runtime_build_id()}\n{int(time.time())}\n", encoding="utf-8")
 
 
 def install_self_launcher() -> None:
@@ -403,16 +455,25 @@ def create_desktop_shortcut() -> None:
     installed_exe = APP_HOME / INSTALLED_EXE_NAME
     if not installed_exe.exists():
         return
+    icon_path = APP_HOME / "srtmatcher.ico"
+    if not icon_path.exists():
+        bundled_icon = source_root() / "srtmatcher.ico"
+        if bundled_icon.exists():
+            retry_file_action(lambda: shutil.copy2(bundled_icon, icon_path), "写入快捷方式图标")
+    if not icon_path.exists():
+        icon_path = APP_DIR / "srtmatcher.ico"
+    if not icon_path.exists():
+        icon_path = installed_exe
     show_progress(85, "创建桌面快捷方式 ...")
     script = (
         "$desktop=[Environment]::GetFolderPath('Desktop');"
-        "$link=Join-Path $desktop 'SRTMatcher.lnk';"
+        f"$link=Join-Path $desktop '{DISPLAY_NAME}.lnk';"
         "$shell=New-Object -ComObject WScript.Shell;"
         "$shortcut=$shell.CreateShortcut($link);"
         f"$shortcut.TargetPath={ps_single_quote(str(installed_exe))};"
         f"$shortcut.WorkingDirectory={ps_single_quote(str(APP_HOME))};"
         "$shortcut.Arguments='--launcher';"
-        f"$shortcut.IconLocation={ps_single_quote(str(installed_exe))};"
+        f"$shortcut.IconLocation={ps_single_quote(str(icon_path))};"
         "$shortcut.Save();"
     )
     try:

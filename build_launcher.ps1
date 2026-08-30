@@ -6,11 +6,41 @@ if (-not (Test-Path -LiteralPath ".\.venv\Scripts\python.exe")) {
     .\install.ps1
 }
 
+$ffmpegCandidates = @()
+if ($env:FFMPEG_EXE) {
+    $ffmpegCandidates += $env:FFMPEG_EXE
+}
+$ffmpegCandidates += @(
+    (Join-Path $PSScriptRoot "vendor\ffmpeg.exe"),
+    "C:\ffmpeg\ffmpeg.exe"
+)
+$ffmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+if ($ffmpegCommand) {
+    $ffmpegCandidates += $ffmpegCommand.Source
+}
+$ffmpeg = $ffmpegCandidates | Where-Object {
+    $_ -and (Test-Path -LiteralPath $_ -PathType Leaf)
+} | Select-Object -First 1
+if (-not $ffmpeg) {
+    throw "ffmpeg.exe not found. Set FFMPEG_EXE or place it at vendor\ffmpeg.exe."
+}
+Write-Host "Bundling FFmpeg: $ffmpeg"
+
 .\.venv\Scripts\python.exe -m pip install pyinstaller
 
-if (Test-Path -LiteralPath ".\dist\SRTMatcherSetup.exe") {
-    Remove-Item -LiteralPath ".\dist\SRTMatcherSetup.exe" -Force
+$buildIdLine = Select-String -LiteralPath ".\bootstrap.py" -Pattern '^APP_BUILD_ID\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $buildIdLine) {
+    throw "APP_BUILD_ID not found in bootstrap.py"
 }
+$buildId = $buildIdLine.Matches[0].Groups[1].Value -replace '[^A-Za-z0-9._-]', '-'
+$buildStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outputFileName = "SRTMatcherSetup-$buildId-$buildStamp.exe"
+$outputRelativePath = "dist\$outputFileName"
+$outputFullPath = Join-Path $PSScriptRoot $outputRelativePath
+if (Test-Path -LiteralPath $outputFullPath) {
+    throw "Refusing to overwrite existing installer: $outputFullPath"
+}
+
 if (Test-Path -LiteralPath ".\dist\nsis_payload") {
     Remove-Item -LiteralPath ".\dist\nsis_payload" -Recurse -Force
 }
@@ -20,14 +50,25 @@ if (Test-Path -LiteralPath ".\dist\nsis_payload") {
     --clean `
     --onefile `
     --windowed `
+    --icon ".\srtmatcher.ico" `
     --distpath ".\dist\nsis_payload" `
     --workpath ".\build\SRTMatcherPayload" `
     --name "SRTMatcher" `
     --add-data "app.py;." `
     --add-data "qt_app.py;." `
+    --add-data "task_runtime.py;." `
+    --add-data "model_runtime.py;." `
+    --add-data "ai_transport.py;." `
+    --add-data "asr_runtime.py;." `
+    --add-data "batch_runtime.py;." `
     --add-data "requirements.txt;." `
     --add-data "README.md;." `
+    --add-data "FFMPEG-NOTICE.txt;." `
+    --add-data "srtmatcher-logo.png;." `
+    --add-data "srtmatcher.ico;." `
     .\bootstrap.py
+
+Copy-Item -LiteralPath $ffmpeg -Destination ".\dist\nsis_payload\ffmpeg.exe" -Force
 
 $makensisCandidates = @(
     "C:\Program Files (x86)\NSIS\makensis.exe",
@@ -47,11 +88,11 @@ $nsiText = [System.IO.File]::ReadAllText($nsiPath, [System.Text.Encoding]::UTF8)
 $utf8Bom = [System.Text.UTF8Encoding]::new($true)
 [System.IO.File]::WriteAllText($nsiPath, $nsiText, $utf8Bom)
 
-& $makensis ".\installer.nsi"
+& $makensis "/DOUTPUT_FILE=$outputRelativePath" ".\installer.nsi"
 
 if (Test-Path -LiteralPath ".\dist\nsis_payload") {
     Remove-Item -LiteralPath ".\dist\nsis_payload" -Recurse -Force
 }
 
 Write-Host ""
-Write-Host "NSIS installer build complete: .\dist\SRTMatcherSetup.exe"
+Write-Host "NSIS installer build complete: $outputFullPath"

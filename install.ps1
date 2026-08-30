@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath ".\.venv\Scripts\python.exe")) {
 
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu126 torch==2.8.0+cu126 torchaudio==2.8.0+cu126 torchvision==0.23.0+cu126
+.\.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0+cu128 torchaudio==2.8.0+cu128 torchvision==0.23.0+cu128
 
 $scipyDistn = ".\.venv\Lib\site-packages\scipy\stats\_distn_infrastructure.py"
 if (Test-Path -LiteralPath $scipyDistn) {

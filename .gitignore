@@ -4,6 +4,7 @@
 
 .venv/
 venv/
+.ocr_runtime/
 .env
 .env.*
 
@@ -13,6 +14,8 @@ dist/
 
 models/
 outputs/
+ocr_candidates/
+ocr_probe/
 *.srt
 *.wav
 *.mp3

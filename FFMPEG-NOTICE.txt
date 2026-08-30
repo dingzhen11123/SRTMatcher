@@ -1,0 +1,19 @@
+FFmpeg third-party component notice
+===================================
+
+SRTMatcher / 字幕多功能工具 distributes an unmodified FFmpeg executable as
+a separate command-line program so WhisperX can decode and resample media.
+
+Bundled build:
+  FFmpeg 2026-06-15-git-44d082edc8 full_build
+  Provider: https://www.gyan.dev/ffmpeg/builds/
+
+FFmpeg is free software licensed separately from SRTMatcher. This build reports
+GPL version 3 configuration. FFmpeg license information and corresponding source
+are available from:
+
+  https://ffmpeg.org/legal.html
+  https://ffmpeg.org/download.html
+  https://github.com/FFmpeg/FFmpeg
+
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
