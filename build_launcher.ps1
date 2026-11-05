@@ -26,7 +26,15 @@ if (-not $ffmpeg) {
 }
 Write-Host "Bundling FFmpeg: $ffmpeg"
 
+function Assert-LastExit([string]$step) {
+    # $ErrorActionPreference 管不到外部程序，必须显式检查退出码。
+    if ($LASTEXITCODE -ne 0) {
+        throw "$step failed with exit code $LASTEXITCODE"
+    }
+}
+
 .\.venv\Scripts\python.exe -m pip install pyinstaller
+Assert-LastExit "pip install pyinstaller"
 
 $buildIdLine = Select-String -LiteralPath ".\bootstrap.py" -Pattern '^APP_BUILD_ID\s*=\s*"([^"]+)"' | Select-Object -First 1
 if (-not $buildIdLine) {
@@ -41,9 +49,31 @@ if (Test-Path -LiteralPath $outputFullPath) {
     throw "Refusing to overwrite existing installer: $outputFullPath"
 }
 
+$buildTime = Get-Date
+# VIProductVersion 需要 4 段数字，每段不超过 65535。
+$appVersion = "{0}.{1}.{2}.{3}" -f $buildTime.Year, $buildTime.Month, $buildTime.Day, ($buildTime.Hour * 100 + $buildTime.Minute)
+
 if (Test-Path -LiteralPath ".\dist\nsis_payload") {
     Remove-Item -LiteralPath ".\dist\nsis_payload" -Recurse -Force
 }
+
+$assetsDir = ".\build\installer-assets"
+.\.venv\Scripts\python.exe .\make_installer_assets.py $assetsDir
+Assert-LastExit "make_installer_assets.py"
+
+# 打包清单只维护一份：bootstrap.SOURCE_FILES 同时决定打包、安装复制和升级指纹。
+$sourceFiles = @(.\.venv\Scripts\python.exe -c "import bootstrap; print('\n'.join(bootstrap.SOURCE_FILES))")
+Assert-LastExit "read bootstrap.SOURCE_FILES"
+$addData = @()
+foreach ($name in $sourceFiles) {
+    $name = $name.Trim()
+    if (-not $name) { continue }
+    if (-not (Test-Path -LiteralPath $name -PathType Leaf)) {
+        throw "SOURCE_FILES entry not found: $name"
+    }
+    $addData += @("--add-data", "$name;.")
+}
+$addData += @("--add-data", "$assetsDir\srtmatcher-logo-64.png;.")
 
 .\.venv\Scripts\python.exe -m PyInstaller `
     --noconfirm `
@@ -54,19 +84,9 @@ if (Test-Path -LiteralPath ".\dist\nsis_payload") {
     --distpath ".\dist\nsis_payload" `
     --workpath ".\build\SRTMatcherPayload" `
     --name "SRTMatcher" `
-    --add-data "app.py;." `
-    --add-data "qt_app.py;." `
-    --add-data "task_runtime.py;." `
-    --add-data "model_runtime.py;." `
-    --add-data "ai_transport.py;." `
-    --add-data "asr_runtime.py;." `
-    --add-data "batch_runtime.py;." `
-    --add-data "requirements.txt;." `
-    --add-data "README.md;." `
-    --add-data "FFMPEG-NOTICE.txt;." `
-    --add-data "srtmatcher-logo.png;." `
-    --add-data "srtmatcher.ico;." `
+    @addData `
     .\bootstrap.py
+Assert-LastExit "PyInstaller"
 
 Copy-Item -LiteralPath $ffmpeg -Destination ".\dist\nsis_payload\ffmpeg.exe" -Force
 
@@ -88,7 +108,11 @@ $nsiText = [System.IO.File]::ReadAllText($nsiPath, [System.Text.Encoding]::UTF8)
 $utf8Bom = [System.Text.UTF8Encoding]::new($true)
 [System.IO.File]::WriteAllText($nsiPath, $nsiText, $utf8Bom)
 
-& $makensis "/DOUTPUT_FILE=$outputRelativePath" ".\installer.nsi"
+& $makensis "/DOUTPUT_FILE=$outputRelativePath" "/DAPP_VERSION=$appVersion" "/DBUILD_ID=$buildId" ".\installer.nsi"
+Assert-LastExit "makensis"
+if (-not (Test-Path -LiteralPath $outputFullPath)) {
+    throw "makensis finished but installer not found: $outputFullPath"
+}
 
 if (Test-Path -LiteralPath ".\dist\nsis_payload") {
     Remove-Item -LiteralPath ".\dist\nsis_payload" -Recurse -Force

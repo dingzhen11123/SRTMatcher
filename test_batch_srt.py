@@ -28,7 +28,7 @@ class FakeWhisperModel:
         return iter(segments), SimpleNamespace(language=language)
 
 
-def fake_corrector(subtitles, base_url, api_key, model, system_prompt, log):
+def fake_corrector(subtitles, base_url, api_key, model, system_prompt, log, **_kwargs):
     return [
         app.Subtitle(sub.index, sub.start, sub.end, f"{sub.text} [corrected]", sub.speaker)
         for sub in subtitles
@@ -79,6 +79,7 @@ class BatchSrtTests(unittest.TestCase):
                 "base_url": "https://example.test/v1",
                 "api_key": "test-key",
                 "ai_model": "test-model",
+                "onset_lead": 0,
             }
 
             with (
@@ -90,6 +91,7 @@ class BatchSrtTests(unittest.TestCase):
                 patch.object(app, "add_cuda_dll_paths"),
                 patch.object(app, "run_whisperx_alignment", side_effect=fake_alignment),
                 patch.object(app, "correct_subtitles_with_ai", side_effect=fake_corrector),
+                patch.object(app, "build_ai_guidance", return_value=app.AIGuidance()),
             ):
                 result = app.run_batch_srt_job(config, lambda _message: None)
 
@@ -116,7 +118,12 @@ class BatchSrtTests(unittest.TestCase):
         fake_whisperx = SimpleNamespace(
             load_align_model=load_align_model,
             load_audio=lambda _path: object(),
-            align=lambda transcript, *_args, **_kwargs: {"segments": transcript},
+            align=lambda transcript, *_args, **_kwargs: {
+                "segments": [
+                    dict(item, words=[{"word": item["text"], "start": item["start"], "end": item["end"]}])
+                    for item in transcript
+                ]
+            },
         )
         subtitles = [app.Subtitle(1, 0.0, 1.0, "hello")]
         cache: dict = {}

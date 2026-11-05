@@ -75,6 +75,19 @@ class ModelRuntime:
                 "diarization_models": len(self._diarization),
             }
 
+    def release_device(self, device: str) -> dict:
+        """Drop every cached alignment/diarization model that lives on ``device``."""
+        target = (device or "").casefold()
+        with self._lock:
+            align_keys = [key for key in self.align_models if str(key[1]).casefold() == target]
+            diarization_keys = [key for key in self._diarization if str(key[1]).casefold() == target]
+            for key in align_keys:
+                self.align_models.pop(key, None)
+            for key in diarization_keys:
+                self._diarization.pop(key, None)
+            self._collect()
+            return {"alignment_models": len(align_keys), "diarization_models": len(diarization_keys)}
+
     def release_all(self) -> dict:
         with self._lock:
             before = self.stats()

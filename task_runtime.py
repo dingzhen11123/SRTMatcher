@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -28,6 +29,10 @@ class CancellationToken:
     def raise_if_cancelled(self) -> None:
         if self.is_cancelled:
             raise TaskCancelled("任务已取消。")
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until cancelled or ``timeout`` elapses; return True when cancelled."""
+        return self._event.wait(timeout)
 
 
 _CURRENT_TOKEN: ContextVar[CancellationToken | None] = ContextVar(
@@ -60,6 +65,36 @@ def check_cancelled() -> None:
     token = current_cancellation_token()
     if token is not None:
         token.raise_if_cancelled()
+
+
+def sleep_cancellable(seconds: float, stop_event: Event | None = None) -> bool:
+    """Sleep for ``seconds`` but wake immediately when the task is cancelled.
+
+    Raises :class:`TaskCancelled` on cancellation.  Returns True when the optional
+    ``stop_event`` was set during the wait (caller decides how to stop), else False.
+    Without a cancellation token or stop event this is a plain ``time.sleep``.
+    """
+    token = current_cancellation_token()
+    seconds = max(0.0, float(seconds or 0.0))
+    if token is None and stop_event is None:
+        time.sleep(seconds)
+        return False
+    deadline = time.monotonic() + seconds
+    while True:
+        if token is not None:
+            token.raise_if_cancelled()
+        if stop_event is not None and stop_event.is_set():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if stop_event is None:
+            token.wait(remaining)
+        elif token is None:
+            stop_event.wait(remaining)
+        else:
+            # Two events cannot be awaited together; poll briefly so both wake fast.
+            token.wait(min(remaining, 0.05))
 
 
 def emit_task_event(event_type: str, **payload) -> None:

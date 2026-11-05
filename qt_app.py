@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import builtins as _builtins
 import re
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -73,6 +75,9 @@ class JobWorker(QObject):
         self.cancel_token.cancel()
 
     def run(self) -> None:
+        # Exactly one terminal signal is always emitted (in ``finally``) so the
+        # QThread quits and the busy state resets even on BaseException.
+        terminal: tuple[Signal, str] | None = None
         try:
             job_type = self.config.get("job_type")
             if job_type == "batch_txt":
@@ -86,12 +91,15 @@ class JobWorker(QObject):
                     self.config, self.log.emit,
                     lambda value, message: self.progress.emit(int(value), message),
                 )
-            self.finished.emit(output)
+            terminal = (self.finished, str(output))
         except TaskCancelled as exc:
-            self.cancelled.emit(str(exc))
-        except Exception as exc:
+            terminal = (self.cancelled, str(exc))
+        except BaseException as exc:
             self.log.emit(traceback.format_exc())
-            self.failed.emit(str(exc))
+            terminal = (self.failed, str(exc) or exc.__class__.__name__)
+        finally:
+            signal, value = terminal or (self.failed, "任务异常终止。")
+            signal.emit(value)
 
 
 class UiEvents(QObject):
@@ -104,6 +112,34 @@ class UiEvents(QObject):
     runtime_links = Signal(str, bool)
     pyannote_text = Signal(str)
     batch_preview = Signal(int, object, str)
+    runtime_downloads = Signal(object)
+    background_finished = Signal(str)
+
+
+WINDOWS_ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def safe_speaker_filename(speaker: str) -> str:
+    """Keep non-ASCII speaker names; only replace characters Windows forbids."""
+    safe = WINDOWS_ILLEGAL_FILENAME_CHARS.sub("_", speaker).strip().rstrip(". ")
+    return safe or "speaker"
+
+
+def decode_script_bytes(data: bytes) -> str | None:
+    """Decode a script text file; return None when no supported encoding fits."""
+    try:
+        if data.startswith(codecs.BOM_UTF8):
+            return data[len(codecs.BOM_UTF8):].decode("utf-8")
+        if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
+            return data.decode("utf-16")
+    except UnicodeDecodeError:
+        return None
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return data.decode(encoding, errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 class DropTextEdit(QPlainTextEdit):
@@ -168,19 +204,21 @@ class MainWindow(QMainWindow):
         self.skipped_batch_paths: set[str] = set()
         self.close_when_idle = False
         self.job_started_at = 0.0
+        self.background_tasks: set[str] = set()
+        self.batch_job_running = False
+        self.batch_subset_run = False
+        self.output_dir_committed = ""
+        self.batch_input_dir_committed = ""
 
         self.setWindowTitle(f"{core.DISPLAY_NAME}（SRTMatcher）")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-        # Keep the preferred desktop size roomy, while the startup policy below
-        # maximizes the window automatically on smaller/high-DPI displays.
-        self.resize(1680, 980)
         self.setMinimumSize(1160, 700)
         self.setAcceptDrops(True)
 
         self.build_ui()
         self.ui_events.log.connect(self.log)
-        self.ui_events.busy.connect(self.set_busy)
+        self.ui_events.busy.connect(lambda busy: self.set_busy(busy, cancellable=False))
         self.ui_events.progress.connect(self.set_progress)
         self.ui_events.model_path.connect(self.apply_model_path)
         self.ui_events.error.connect(lambda title, message: QMessageBox.critical(self, title, message))
@@ -188,6 +226,8 @@ class MainWindow(QMainWindow):
         self.ui_events.runtime_links.connect(self.set_runtime_links)
         self.ui_events.pyannote_text.connect(self.set_pyannote_text)
         self.ui_events.batch_preview.connect(self.apply_batch_preview)
+        self.ui_events.runtime_downloads.connect(self.set_runtime_downloads)
+        self.ui_events.background_finished.connect(self.on_background_task_finished)
         self.load_config_to_ui()
         self.update_mode_state()
         self.update_output_path()
@@ -465,7 +505,9 @@ class MainWindow(QMainWindow):
         self.output_format.addItem("SRT 字幕", "srt")
         self.output_format.addItem("TXT 文本", "txt")
         self.output_format.currentIndexChanged.connect(self.on_output_format_changed)
-        self.output_dir.editingFinished.connect(lambda: (setattr(self, "output_path_custom", False), self.update_output_path()))
+        self.output_dir.editingFinished.connect(self.on_output_dir_edited)
+        self.output_path.textEdited.connect(self.on_output_path_edited)
+        self.audio_path.textEdited.connect(self.on_audio_path_edited)
         self.add_path_row(file_grid, 0, "音频/视频", self.audio_path, self.pick_audio)
         self.add_path_row(file_grid, 1, "文稿 TXT", self.text_path, self.pick_text)
         file_grid.addWidget(QLabel("导出格式"), 2, 0)
@@ -592,7 +634,10 @@ class MainWindow(QMainWindow):
         path_grid = QGridLayout(paths)
         self.batch_input_dir = QLineEdit()
         self.batch_output_dir = QLineEdit()
-        self.add_path_row(path_grid, 0, "媒体目录", self.batch_input_dir, self.pick_batch_input_dir)
+        self.batch_input_btn = self.add_path_row(
+            path_grid, 0, "媒体目录", self.batch_input_dir, self.pick_batch_input_dir
+        )
+        self.batch_input_dir.editingFinished.connect(self.on_batch_input_dir_edited)
         self.batch_output_label = QLabel("TXT 输出目录")
         self.batch_output_btn = QPushButton("选择...")
         self.batch_output_btn.clicked.connect(self.pick_batch_output_dir)
@@ -658,44 +703,8 @@ class MainWindow(QMainWindow):
         self.on_batch_format_changed()
         return page
 
-    def build_ai_tab(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        grid = QGridLayout()
-        self.base_url = QLineEdit()
-        self.api_key = QLineEdit()
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ai_model = QLineEdit()
-        self.hf_token = QLineEdit()
-        self.hf_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self.min_speakers = QLineEdit()
-        self.max_speakers = QLineEdit()
-        self.add_form_row(grid, 0, "Base URL", self.base_url)
-        self.add_form_row(grid, 1, "API Key", self.api_key)
-        self.add_form_row(grid, 2, "模型名", self.ai_model)
-        self.add_form_row(grid, 3, "Hugging Face Token", self.hf_token)
-        self.add_form_row(grid, 4, "最小说话人数", self.min_speakers)
-        self.add_form_row(grid, 5, "最大说话人数", self.max_speakers)
-        layout.addLayout(grid)
-
-        layout.addWidget(QLabel("系统提示词"))
-        self.prompt_text = QPlainTextEdit()
-        self.prompt_text.setPlainText(self.config_data.get("system_prompt", core.DEFAULT_SYSTEM_PROMPT))
-        layout.addWidget(self.prompt_text, 2)
-
-        test_row = QHBoxLayout()
-        self.save_btn = QPushButton("保存配置")
-        self.save_btn.clicked.connect(self.save_config)
-        test_row.addStretch(1)
-        test_row.addWidget(self.save_btn)
-        layout.addLayout(test_row)
-        return page
-
     def build_settings_tab(self) -> QWidget:
-        scroll = SettingsScrollArea(980)
+        scroll = SettingsScrollArea(1110)
         scroll.setObjectName("SettingsScroll")
         page = QWidget()
         page.setObjectName("WorkspacePage")
@@ -705,10 +714,12 @@ class MainWindow(QMainWindow):
         layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         top = QGroupBox("01  常用设置")
-        top.setMinimumHeight(180)
+        top.setMinimumHeight(220)
         top_grid = QGridLayout(top)
         top_grid.setColumnStretch(1, 1)
-        self.add_settings_path_row(top_grid, 0, "默认输出目录", self.output_dir, self.pick_output_dir, self.open_output_dir)
+        self.output_dir_pick_btn = self.add_settings_path_row(
+            top_grid, 0, "默认输出目录", self.output_dir, self.pick_output_dir, self.open_output_dir
+        )
         self.add_settings_path_row(top_grid, 1, "模型目录", self.model_path, self.open_model_dir, None, browse_text="打开")
         top_grid.addWidget(QLabel("设备"), 2, 0)
         top_grid.addWidget(self.device, 2, 1)
@@ -717,6 +728,22 @@ class MainWindow(QMainWindow):
         self.save_settings_btn = QPushButton("保存设置")
         self.save_settings_btn.clicked.connect(self.save_config)
         top_grid.addWidget(self.save_settings_btn, 3, 2)
+        self.onset_lead = QDoubleSpinBox()
+        self.onset_lead.setRange(0.0, 1.0)
+        self.onset_lead.setSingleStep(0.05)
+        self.onset_lead.setDecimals(2)
+        self.onset_lead.setSuffix(" 秒")
+        self.onset_lead.setValue(core.onset_lead_from_config(self.config_data))
+        self.onset_lead.setToolTip(
+            "SRT 每条字幕的起点提前量（不会与上一条重叠）。\n"
+            "按字幕切音频训练时可避免丢掉句首音节；设为 0 则关闭。"
+        )
+        top_grid.addWidget(QLabel("句首余量"), 4, 0)
+        top_grid.addWidget(self.onset_lead, 4, 1)
+        self.output_to_source = QCheckBox("输出到上传文件所在文件夹（取消勾选则使用上面的默认输出目录）")
+        self.output_to_source.toggled.connect(self.on_output_location_changed)
+        top_grid.addWidget(QLabel("输出位置"), 5, 0)
+        top_grid.addWidget(self.output_to_source, 5, 1, 1, 3)
         layout.addWidget(top)
 
         body = QHBoxLayout()
@@ -796,7 +823,7 @@ class MainWindow(QMainWindow):
         lower.setSpacing(10)
 
         ai_box = QGroupBox("04  AI 校对接口")
-        ai_box.setMinimumHeight(310)
+        ai_box.setMinimumHeight(440)
         ai_layout = QVBoxLayout(ai_box)
         ai_grid = QGridLayout()
         self.base_url = QLineEdit()
@@ -809,9 +836,27 @@ class MainWindow(QMainWindow):
         ai_layout.addLayout(ai_grid)
         self.prompt_text = QPlainTextEdit()
         self.prompt_text.setMinimumHeight(110)
-        self.prompt_text.setPlainText(self.config_data.get("system_prompt", core.DEFAULT_SYSTEM_PROMPT))
-        ai_layout.addWidget(QLabel("系统提示词"))
+        self.prompt_text.setPlainText(core.resolve_system_prompt(self.config_data.get("system_prompt")))
+        prompt_header = QHBoxLayout()
+        prompt_header.addWidget(QLabel("系统提示词"))
+        prompt_header.addStretch(1)
+        self.reset_prompt_btn = QPushButton("恢复默认提示词")
+        self.reset_prompt_btn.clicked.connect(
+            lambda: self.prompt_text.setPlainText(core.DEFAULT_SYSTEM_PROMPT)
+        )
+        prompt_header.addWidget(self.reset_prompt_btn)
+        ai_layout.addLayout(prompt_header)
         ai_layout.addWidget(self.prompt_text)
+        self.glossary_text = QPlainTextEdit()
+        self.glossary_text.setMinimumHeight(80)
+        self.glossary_text.setPlaceholderText(
+            "每行一个专有名词/术语，AI 会优先按这里的写法纠错，例如：\n"
+            "Bundestag\n"
+            "英伟达 | 英伟大, 应为达"
+        )
+        self.glossary_text.setPlainText(str(self.config_data.get("ai_glossary", "")))
+        ai_layout.addWidget(QLabel("热词 / 术语表（可选，格式：正确写法 | 常见误识别）"))
+        ai_layout.addWidget(self.glossary_text)
         lower.addWidget(ai_box, 1)
 
         speaker_box = QGroupBox("05  说话人模型")
@@ -898,15 +943,17 @@ class MainWindow(QMainWindow):
         self.speaker_table = QTableWidget(0, 5)
         self.speaker_table.setHorizontalHeaderLabels(["序号", "开始", "结束", "说话人", "文本"])
         self.speaker_table.verticalHeader().setVisible(False)
+        self.speaker_table.itemChanged.connect(self.on_speaker_item_changed)
         layout.addWidget(self.speaker_table, 1)
         return page
 
-    def add_path_row(self, grid: QGridLayout, row: int, label: str, edit: QLineEdit, picker, button_text: str = "选择") -> None:
+    def add_path_row(self, grid: QGridLayout, row: int, label: str, edit: QLineEdit, picker, button_text: str = "选择") -> QPushButton:
         button = QPushButton(button_text)
         button.clicked.connect(picker)
         grid.addWidget(QLabel(label), row, 0)
         grid.addWidget(edit, row, 1)
         grid.addWidget(button, row, 2)
+        return button
 
     def add_form_row(self, grid: QGridLayout, row: int, label: str, edit: QLineEdit) -> None:
         grid.addWidget(QLabel(label), row, 0)
@@ -922,7 +969,7 @@ class MainWindow(QMainWindow):
         opener,
         browse_text: str = "选择",
         open_text: str = "打开",
-    ) -> None:
+    ) -> QPushButton:
         pick_btn = QPushButton(browse_text)
         pick_btn.clicked.connect(picker)
         grid.addWidget(QLabel(label), row, 0)
@@ -932,9 +979,15 @@ class MainWindow(QMainWindow):
             open_btn = QPushButton(open_text)
             open_btn.clicked.connect(opener)
             grid.addWidget(open_btn, row, 3)
+        return pick_btn
 
     def load_config_to_ui(self) -> None:
         self.output_dir.setText(self.config_data.get("output_dir", str(core.INSTALL_ROOT / "outputs")))
+        self.output_dir_committed = self.output_dir.text().strip()
+        self.output_to_source.blockSignals(True)
+        self.output_to_source.setChecked(self.config_data.get("output_location", "source") != "fixed")
+        self.output_to_source.blockSignals(False)
+        self.sync_output_location_widgets()
         self.set_combo_data(self.output_format, self.config_data.get("output_format", "srt"))
         self.output_path.setText(self.config_data.get("output_path", ""))
         self.model_path.setText(str(core.default_model_root_dir()))
@@ -951,7 +1004,7 @@ class MainWindow(QMainWindow):
         self.diarization_enabled.setChecked(bool(self.config_data.get("diarization_enabled", False)))
         self.base_url.setText(self.config_data.get("base_url", "https://api.openai.com/v1"))
         self.api_key.setText(self.config_data.get("api_key", ""))
-        self.ai_model.setText(self.config_data.get("ai_model", "gemini-2.5-pro"))
+        self.ai_model.setText(self.config_data.get("ai_model", core.DEFAULT_AI_MODEL))
         self.hf_token.setText(self.config_data.get("hf_token", ""))
         self.min_speakers.setText(str(self.config_data.get("min_speakers", "")))
         self.max_speakers.setText(str(self.config_data.get("max_speakers", "")))
@@ -994,8 +1047,31 @@ class MainWindow(QMainWindow):
         return mode
 
     def on_mode_changed(self) -> None:
-        self.output_path_custom = False
         self.update_mode_state()
+        current_path = self.output_path.text().strip()
+        if self.output_path_custom and current_path:
+            # Keep the user's directory/name; only make sure the extension matches the format.
+            extension = f".{self.current_output_format()}"
+            if Path(current_path).suffix.lower() != extension:
+                self.output_path.setText(str(Path(current_path).with_suffix(extension)))
+        else:
+            self.update_output_path()
+
+    def on_output_path_edited(self, text: str) -> None:
+        # Typing a path by hand makes it a custom path; clearing it returns to auto naming.
+        self.output_path_custom = bool(text.strip())
+
+    def on_audio_path_edited(self, _text: str) -> None:
+        # 和“选择文件”一致：换了媒体就重新生成输出路径，否则新文件的结果会覆盖旧文件的字幕。
+        self.output_path_custom = False
+        self.update_output_path()
+
+    def on_output_dir_edited(self) -> None:
+        value = self.output_dir.text().strip()
+        if value == self.output_dir_committed:
+            return
+        self.output_dir_committed = value
+        self.output_path_custom = False
         self.update_output_path()
 
     def on_script_changed(self) -> None:
@@ -1034,12 +1110,28 @@ class MainWindow(QMainWindow):
             self.start_btn.setText(f"开始转 {output_label}")
             self.whisperx_enabled.setEnabled(False)
 
+    def output_directory(self) -> Path:
+        """Folder for auto-named outputs: next to the media file, or the fixed default folder."""
+        audio = self.audio_path.text().strip()
+        if self.output_to_source.isChecked() and audio:
+            return Path(audio).parent
+        return Path(self.output_dir.text().strip() or str(core.INSTALL_ROOT / "outputs"))
+
     def generated_output_path(self) -> str:
         audio = self.audio_path.text().strip()
         stem = Path(audio).stem if audio else "output"
         suffix = "aligned" if self.effective_mode() == "align" else "transcribed"
-        out_dir = Path(self.output_dir.text().strip() or str(core.INSTALL_ROOT / "outputs"))
-        return str(out_dir / f"{stem}.{suffix}.{self.current_output_format()}")
+        return str(self.output_directory() / f"{stem}.{suffix}.{self.current_output_format()}")
+
+    def sync_output_location_widgets(self) -> None:
+        fixed = not self.output_to_source.isChecked()
+        self.output_dir.setEnabled(fixed)
+        self.output_dir_pick_btn.setEnabled(fixed)
+
+    def on_output_location_changed(self, _checked: bool) -> None:
+        self.sync_output_location_widgets()
+        self.output_path_custom = False
+        self.update_output_path()
 
     def update_output_path(self) -> None:
         if not self.output_path_custom:
@@ -1061,11 +1153,12 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择固定输出目录")
         if path:
             self.output_dir.setText(path)
+            self.output_dir_committed = path.strip()
             self.output_path_custom = False
             self.update_output_path()
 
     def open_output_dir(self) -> None:
-        path = Path(self.output_dir.text().strip() or str(core.INSTALL_ROOT / "outputs"))
+        path = self.output_directory()
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
@@ -1081,9 +1174,9 @@ class MainWindow(QMainWindow):
         )
         if path:
             path = str(Path(path).with_suffix(f".{output_format}"))
+            # One-off "save as": do not touch the persistent default output directory.
             self.output_path_custom = True
             self.output_path.setText(path)
-            self.output_dir.setText(str(Path(path).parent))
 
     def pick_batch_input_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择包含音频/视频的目录")
@@ -1143,14 +1236,22 @@ class MainWindow(QMainWindow):
                 str(Path(output_value).parent / f"{extension}_outputs")
             )
 
+    def on_batch_input_dir_edited(self) -> None:
+        if self.batch_input_dir.text().strip() != self.batch_input_dir_committed:
+            self.refresh_batch_preview()
+
     def refresh_batch_preview(self) -> None:
+        if self.batch_job_running:
+            return
         value = self.batch_input_dir.text().strip()
+        self.batch_input_dir_committed = value
         self.preview_generation += 1
         generation = self.preview_generation
         self.completed_batch_paths.clear()
         self.skipped_batch_paths.clear()
         self.failed_batch_paths.clear()
         self.update_batch_metrics()
+        self.batch_retry_btn.setEnabled(False)
         if not value:
             self.batch_preview_label.setText("尚未选择媒体目录")
             self.batch_table.setRowCount(0)
@@ -1217,9 +1318,21 @@ class MainWindow(QMainWindow):
 
     def load_text_file(self, path: str) -> None:
         try:
-            content = Path(path).read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            content = Path(path).read_text(encoding="gbk", errors="replace")
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "无法读取文稿",
+                f"读取文件失败（可能不存在或被其他程序占用）：\n{path}\n\n{exc}",
+            )
+            return
+        content = decode_script_bytes(data)
+        if content is None:
+            QMessageBox.warning(
+                self, "无法识别文稿编码",
+                f"无法按 UTF-8 / UTF-16 / GBK 读取该文件，已取消加载以免出现乱码：\n{path}\n\n"
+                "请用记事本等工具另存为 UTF-8 编码后重试。",
+            )
+            return
         self.text_path.setText(path)
         self.script_text.setPlainText(content)
         self.update_mode_state()
@@ -1246,6 +1359,7 @@ class MainWindow(QMainWindow):
             "audio_path": self.audio_path.text(),
             "text_path": self.text_path.text(),
             "output_dir": self.output_dir.text(),
+            "output_location": "source" if self.output_to_source.isChecked() else "fixed",
             "output_path": self.output_path.text(),
             "output_path_custom": self.output_path_custom,
             "output_format": self.current_output_format(),
@@ -1266,6 +1380,8 @@ class MainWindow(QMainWindow):
             "min_speakers": self.min_speakers.text().strip(),
             "max_speakers": self.max_speakers.text().strip(),
             "system_prompt": self.prompt_text.toPlainText().strip(),
+            "ai_glossary": self.glossary_text.toPlainText().strip(),
+            "onset_lead": self.onset_lead.value(),
             "script": self.script_text.toPlainText(),
             "batch_input_dir": self.batch_input_dir.text().strip(),
             "batch_output_dir": self.batch_output_dir.text().strip(),
@@ -1313,6 +1429,9 @@ class MainWindow(QMainWindow):
         config["job_type"] = (
             "batch_srt" if config.get("batch_output_format") == "srt" else "batch_txt"
         )
+        # Invalidate any in-flight preview scan so a slow result cannot reset the job's table.
+        self.preview_generation += 1
+        self.batch_subset_run = bool(only_paths)
         self.launch_worker(config, self.on_batch_finished)
 
     def retry_failed_batch_items(self) -> None:
@@ -1322,6 +1441,7 @@ class MainWindow(QMainWindow):
         self.start_batch_job(only_paths=sorted(self.failed_batch_paths))
 
     def launch_worker(self, config: dict, finished_handler) -> None:
+        self.batch_job_running = str(config.get("job_type", "")).startswith("batch")
         self.set_busy(True)
         self.job_started_at = time.monotonic()
         self.worker_thread = QThread()
@@ -1337,9 +1457,8 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker.cancelled.connect(self.worker_thread.quit)
-        self.worker_thread.finished.connect(self.worker.deleteLater)
+        # worker 和 QThread 都由 Python 持有引用，这里不能再接 deleteLater，否则会重复释放。
         self.worker_thread.finished.connect(self.on_worker_thread_finished)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
     def on_job_finished(self, output: str) -> None:
@@ -1377,13 +1496,22 @@ class MainWindow(QMainWindow):
         elapsed = time.monotonic() - self.job_started_at if self.job_started_at else 0.0
         if elapsed > 0:
             self.log(f"本次任务耗时: {elapsed:.1f} 秒")
-        self.set_busy(False)
+        # finished 信号发出时线程还没真正退出；这时释放 QThread 会触发
+        # “Destroyed while thread is still running”，让整个进程中止。
+        thread = self.worker_thread
+        worker = self.worker
         self.worker = None
         self.worker_thread = None
+        if thread is not None:
+            thread.wait()
+        del worker, thread
+        self.batch_job_running = False
+        self.batch_subset_run = False
+        self.set_busy(False)
         if self.close_when_idle:
             QTimer.singleShot(0, self.close)
 
-    def set_busy(self, busy: bool) -> None:
+    def set_busy(self, busy: bool, cancellable: bool = True) -> None:
         if busy:
             self.progress.setRange(0, 0)
             self.progress.setValue(0)
@@ -1392,14 +1520,18 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 100)
         self.progress.setVisible(busy)
         self.task_dock.setVisible(busy)
-        self.stage_bar.setVisible(busy)
-        self.cancel_btn.setVisible(busy)
-        self.cancel_btn.setEnabled(busy)
+        # Background tasks (model download, runtime repair) have no worker to cancel.
+        self.stage_bar.setVisible(busy and cancellable)
+        self.cancel_btn.setVisible(busy and cancellable)
+        self.cancel_btn.setEnabled(busy and cancellable)
         self.cancel_btn.setText("取消任务")
         self.status_label.setText("处理中..." if busy else "就绪")
         self.start_btn.setEnabled(not busy)
         self.batch_start_btn.setEnabled(not busy)
         self.batch_refresh_btn.setEnabled(not busy)
+        self.batch_recursive.setEnabled(not busy)
+        self.batch_input_dir.setEnabled(not busy)
+        self.batch_input_btn.setEnabled(not busy)
         self.batch_output_format.setEnabled(not busy)
         self.output_format.setEnabled(not busy)
         self.gpu_btn.setEnabled(not busy)
@@ -1435,6 +1567,12 @@ class MainWindow(QMainWindow):
             return
         if event_type == "batch_discovered":
             files = [str(path) for path in event.get("files", [])]
+            if self.batch_subset_run:
+                # Retry of a subset: keep the full table, only make sure the rows exist.
+                for path in files:
+                    if path.casefold() not in self.batch_row_by_path:
+                        self.ensure_batch_row(path, "等待重试", "")
+                return
             self.apply_batch_preview(self.preview_generation, files, "")
             return
         if event_type != "file_status":
@@ -1529,7 +1667,6 @@ class MainWindow(QMainWindow):
         hf_token = self.hf_token.text().strip()
 
         def task() -> None:
-            self.ui_events.busy.emit(True)
             try:
                 status = core.prepare_pyannote_model(hf_token, self.ui_events.log.emit)
                 detail = "已缓存" if status.get("ready") else "未就绪"
@@ -1539,10 +1676,37 @@ class MainWindow(QMainWindow):
                 self.ui_events.log.emit(traceback.format_exc())
                 self.ui_events.pyannote_text.emit("未就绪。请确认 HF Token 正确，并已在授权页面同意许可。")
                 self.ui_events.error.emit("说话人模型下载失败", str(exc))
-            finally:
-                self.ui_events.busy.emit(False)
 
-        threading.Thread(target=task, daemon=True).start()
+        self.start_background_task("pyannote", task)
+
+    def start_background_task(self, name: str, target, *, busy: bool = True) -> None:
+        """Run ``target`` on a plain thread. It must only talk to the UI via ``self.ui_events``.
+
+        Busy tasks are tracked so closing the window asks for confirmation and the
+        (non-functional) cancel button stays hidden.
+        """
+        if busy:
+            self.background_tasks.add(name)
+            self.set_busy(True, cancellable=False)
+
+        def runner() -> None:
+            try:
+                target()
+            except BaseException:
+                self.ui_events.log.emit(traceback.format_exc())
+            finally:
+                if busy:
+                    self.ui_events.background_finished.emit(name)
+
+        threading.Thread(target=runner, daemon=True, name=f"background-{name}").start()
+
+    def on_background_task_finished(self, name: str) -> None:
+        self.background_tasks.discard(name)
+        if not self.background_tasks and not (self.worker_thread and self.worker_thread.isRunning()):
+            self.set_busy(False)
+
+    def set_runtime_downloads(self, downloads: object) -> None:
+        self.cuda_links = dict(downloads or {})
 
     def open_download_link(self, key: str) -> None:
         if not self.cuda_links:
@@ -1568,7 +1732,8 @@ class MainWindow(QMainWindow):
         ]
         return "<br>".join(f'<a href="{url}">{label}</a>' for label, url in links if url)
 
-    def build_runtime_report(self) -> tuple[str, bool, dict]:
+    def build_runtime_report(self, wants_cuda: bool) -> tuple[str, bool, dict]:
+        """Runs on a background thread: must not touch widgets (read them before starting)."""
         core.add_cuda_dll_paths()
         import ctranslate2
 
@@ -1583,7 +1748,6 @@ class MainWindow(QMainWindow):
             ffmpeg_path = core.add_bundled_ffmpeg_path()
         except Exception:
             ffmpeg_path = "未找到"
-        wants_cuda = self.device.currentText().lower() == "cuda"
 
         if not wants_cuda:
             ok = True
@@ -1653,23 +1817,51 @@ class MainWindow(QMainWindow):
             return
         self.load_srt_to_speaker_table(path)
 
-    def load_srt_to_speaker_table(self, path: str) -> None:
+    def load_srt_to_speaker_table(self, path: str) -> bool:
+        try:
+            items = self.parse_srt_file(path)
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "无法读取 SRT",
+                f"读取文件失败（可能不存在或被其他程序占用）：\n{path}\n\n{exc}",
+            )
+            return False
         self.last_srt_path = path
-        items = self.parse_srt_file(path)
-        self.speaker_table.setRowCount(0)
-        speakers = set()
-        for item in items:
-            row = self.speaker_table.rowCount()
-            self.speaker_table.insertRow(row)
-            values = [item["index"], item["start"], item["end"], item["speaker"], item["text"]]
-            for column, value in enumerate(values):
-                self.speaker_table.setItem(row, column, QTableWidgetItem(str(value)))
-            if item["speaker"]:
-                speakers.add(item["speaker"])
+        self.speaker_table.blockSignals(True)
+        try:
+            self.speaker_table.setRowCount(0)
+            for item in items:
+                row = self.speaker_table.rowCount()
+                self.speaker_table.insertRow(row)
+                values = [item["index"], item["start"], item["end"], item["speaker"], item["text"]]
+                for column, value in enumerate(values):
+                    self.speaker_table.setItem(row, column, QTableWidgetItem(str(value)))
+        finally:
+            self.speaker_table.blockSignals(False)
         self.speaker_file_label.setText(str(Path(path).name))
         self.speaker_combo.clear()
-        self.speaker_combo.addItems(sorted(speakers))
+        self.refresh_speaker_combo()
         self.speaker_table.resizeColumnsToContents()
+        return True
+
+    def refresh_speaker_combo(self) -> None:
+        """Rebuild the speaker list from the (possibly edited) table, keeping the selection."""
+        speakers = sorted({item["speaker"] for item in self.speaker_table_items() if item["speaker"]})
+        if speakers == [self.speaker_combo.itemText(i) for i in range(self.speaker_combo.count())]:
+            return
+        current = self.speaker_combo.currentText().strip()
+        self.speaker_combo.blockSignals(True)
+        try:
+            self.speaker_combo.clear()
+            self.speaker_combo.addItems(speakers)
+            if current in speakers:
+                self.speaker_combo.setCurrentIndex(speakers.index(current))
+        finally:
+            self.speaker_combo.blockSignals(False)
+
+    def on_speaker_item_changed(self, item: QTableWidgetItem) -> None:
+        if item is not None and item.column() == 3:
+            self.refresh_speaker_combo()
 
     def speaker_table_items(self) -> list[dict]:
         items = []
@@ -1704,35 +1896,56 @@ class MainWindow(QMainWindow):
             output_index += 1
         return "\n\n".join(blocks) + ("\n" if blocks else "")
 
+    def show_write_error(self, path: Path | str, exc: Exception) -> None:
+        QMessageBox.critical(
+            self, "保存失败",
+            f"无法写入文件（可能被其他程序占用，或没有写入权限）：\n{path}\n\n{exc}",
+        )
+
     def save_edited_srt(self) -> None:
         if not self.last_srt_path:
             QMessageBox.warning(self, "没有 SRT", "当前没有可保存的 SRT。")
             return
-        Path(self.last_srt_path).write_text(self.srt_text_from_items(self.speaker_table_items()), encoding="utf-8-sig")
+        try:
+            Path(self.last_srt_path).write_text(self.srt_text_from_items(self.speaker_table_items()), encoding="utf-8-sig")
+        except OSError as exc:
+            self.show_write_error(self.last_srt_path, exc)
+            return
         self.log(f"已保存编辑后的 SRT: {self.last_srt_path}")
 
     def export_selected_speaker(self, kind: str) -> None:
+        self.refresh_speaker_combo()
         speaker = self.speaker_combo.currentText().strip()
         if not speaker:
             QMessageBox.warning(self, "未选择说话人", "当前 SRT 没有可导出的说话人标签。")
             return
+        items = [item for item in self.speaker_table_items() if item["speaker"] == speaker]
+        if not items:
+            QMessageBox.warning(self, "没有字幕", f"表格中没有说话人为“{speaker}”的字幕行，未导出文件。")
+            return
         base = Path(self.last_srt_path or self.output_path.text().strip() or "speaker.srt")
-        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", speaker).strip("_") or "speaker"
+        safe = safe_speaker_filename(speaker)
         if kind == "srt":
             path = base.with_name(f"{base.stem}.{safe}.edited.srt")
-            path.write_text(self.srt_text_from_items(self.speaker_table_items(), speaker), encoding="utf-8-sig")
+            content = self.srt_text_from_items(items, speaker)
         else:
             path = base.with_name(f"{base.stem}.{safe}.edited.txt")
-            lines = [item["text"] for item in self.speaker_table_items() if item["speaker"] == speaker]
-            path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8-sig")
+            content = "\n".join(item["text"] for item in items) + "\n"
+        try:
+            path.write_text(content, encoding="utf-8-sig")
+        except OSError as exc:
+            self.show_write_error(path, exc)
+            return
         self.log(f"已导出 {speaker}: {path}")
 
     def check_runtime(self) -> None:
+        wants_cuda = self.device.currentText().lower() == "cuda"
+
         def task() -> None:
             try:
-                text, ok, downloads = self.build_runtime_report()
-                self.cuda_links = downloads
-                self.log(text)
+                text, ok, downloads = self.build_runtime_report(wants_cuda)
+                self.ui_events.runtime_downloads.emit(downloads)
+                self.ui_events.log.emit(text)
                 self.ui_events.runtime_text.emit(text)
                 if ok:
                     self.ui_events.runtime_links.emit("", False)
@@ -1740,14 +1953,15 @@ class MainWindow(QMainWindow):
                 self.ui_events.log.emit(traceback.format_exc())
                 self.ui_events.error.emit("运行环境检查失败", str(exc))
 
-        threading.Thread(target=task, daemon=True).start()
+        self.start_background_task("runtime-check", task, busy=False)
 
     def complete_runtime_missing(self) -> None:
+        wants_cuda = self.device.currentText().lower() == "cuda"
+
         def task() -> None:
-            self.ui_events.busy.emit(True)
             try:
-                text, ok, downloads = self.build_runtime_report()
-                self.cuda_links = downloads
+                text, ok, downloads = self.build_runtime_report(wants_cuda)
+                self.ui_events.runtime_downloads.emit(downloads)
                 if ok and "PyTorch CUDA 实际运算: 通过" in text:
                     self.ui_events.runtime_links.emit("", False)
                     self.ui_events.runtime_text.emit(text + "\n\n无需补齐。")
@@ -1756,8 +1970,8 @@ class MainWindow(QMainWindow):
                 if core.detect_nvidia_smi().get("available"):
                     self.ui_events.runtime_text.emit(text + "\n\n正在补齐 Python CUDA 依赖 ...")
                     core.install_recommended_torch(self.ui_events.log.emit)
-                    text_after, ok_after, downloads_after = self.build_runtime_report()
-                    self.cuda_links = downloads_after
+                    text_after, ok_after, downloads_after = self.build_runtime_report(wants_cuda)
+                    self.ui_events.runtime_downloads.emit(downloads_after)
                     if ok_after:
                         self.ui_events.runtime_links.emit("", False)
                         self.ui_events.runtime_text.emit(text_after + "\n\n补齐完成，请重启软件后再检测一次。")
@@ -1768,28 +1982,11 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.ui_events.log.emit(traceback.format_exc())
                 self.ui_events.error.emit("补齐运行环境失败", str(exc))
-            finally:
-                self.ui_events.busy.emit(False)
 
-        threading.Thread(target=task, daemon=True).start()
-
-    def repair_cuda_runtime(self) -> None:
-        def task() -> None:
-            self.set_busy(True)
-            try:
-                core.install_recommended_torch(self.log)
-                self.log("CUDA 加速依赖安装完成。请重启软件后再检查运行环境。")
-            except Exception as exc:
-                self.log(traceback.format_exc())
-                QMessageBox.critical(self, "CUDA 修复失败", str(exc))
-            finally:
-                self.set_busy(False)
-
-        threading.Thread(target=task, daemon=True).start()
+        self.start_background_task("runtime-repair", task)
 
     def check_model_files(self) -> None:
         def task() -> None:
-            self.ui_events.busy.emit(True)
             try:
                 model_dir = core.prepare_model_files(
                     str(core.default_user_model_dir()),
@@ -1801,10 +1998,8 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.ui_events.log.emit(traceback.format_exc())
                 self.ui_events.error.emit("模型检查失败", str(exc))
-            finally:
-                self.ui_events.busy.emit(False)
 
-        threading.Thread(target=task, daemon=True).start()
+        self.start_background_task("model-download", task)
 
     def closeEvent(self, event) -> None:
         if self.worker_thread and self.worker_thread.isRunning():
@@ -1822,6 +2017,18 @@ class MainWindow(QMainWindow):
             self.cancel_current_job()
             event.ignore()
             return
+        if self.background_tasks:
+            answer = QMessageBox.question(
+                self,
+                "后台任务正在运行",
+                "模型下载或运行环境安装仍在进行。现在退出可能导致下载/安装不完整，"
+                "下次需要重新补齐。\n\n确定要退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         event.accept()
 
 
@@ -2058,6 +2265,79 @@ def self_test() -> dict:
     return result
 
 
+def install_exception_hooks(get_window) -> None:
+    """Surface uncaught exceptions: the GUI runs under pythonw, so stderr is invisible.
+
+    ``get_window`` returns the MainWindow (or None while it is being constructed).
+    Reports are routed through ``ui_events`` signals, so this is safe from any thread.
+    """
+    state = {"depth": 0}
+
+    def report(exc_type, exc_value, exc_tb) -> None:
+        if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            if sys.stderr is not None:
+                sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+        summary = f"{getattr(exc_type, '__name__', 'Error')}: {exc_value}"
+        state["depth"] += 1
+        try:
+            window = get_window()
+            if window is not None:
+                window.ui_events.log.emit("未处理的错误：\n" + text)
+                if state["depth"] == 1:
+                    window.ui_events.error.emit(
+                        "程序出错",
+                        f"发生未处理的错误，当前操作可能没有完成：\n{summary}\n\n详细信息已写入日志。",
+                    )
+            elif (
+                state["depth"] == 1
+                and QApplication.instance() is not None
+                and threading.current_thread() is threading.main_thread()
+            ):
+                QMessageBox.critical(None, "程序出错", f"{summary}\n\n{text[-3000:]}")
+        except Exception:
+            pass
+        finally:
+            state["depth"] -= 1
+
+    def thread_report(args) -> None:
+        if args.exc_type is SystemExit:
+            return
+        report(args.exc_type, args.exc_value, args.exc_traceback)
+
+    sys.excepthook = report
+    threading.excepthook = thread_report
+
+
+PREFERRED_WINDOW_SIZE = (1600, 960)
+
+
+def show_main_window(window: QMainWindow) -> None:
+    """Open at a comfortable fixed size, centered; only maximize when the screen is too small."""
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is None:
+        window.resize(*PREFERRED_WINDOW_SIZE)
+        window.show()
+        return
+    available = screen.availableGeometry()
+    minimum = window.minimumSize()
+    if available.width() < minimum.width() + 80 or available.height() < minimum.height() + 60:
+        window.showMaximized()
+        return
+    width = max(minimum.width(), min(PREFERRED_WINDOW_SIZE[0], int(available.width() * 0.85)))
+    height = max(minimum.height(), min(PREFERRED_WINDOW_SIZE[1], int(available.height() * 0.88)))
+    window.resize(width, height)
+    frame = window.frameGeometry()
+    frame.moveCenter(available.center())
+    window.move(frame.topLeft())
+    window.show()
+
+
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         result = self_test()
@@ -2072,6 +2352,9 @@ if __name__ == "__main__":
     if APP_ICON_PATH.exists():
         qt_app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     apply_style(qt_app)
+    window_holder: dict[str, MainWindow] = {}
+    install_exception_hooks(lambda: window_holder.get("window"))
     window = MainWindow()
-    window.showMaximized()
+    window_holder["window"] = window
+    show_main_window(window)
     sys.exit(qt_app.exec())
