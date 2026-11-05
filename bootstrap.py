@@ -15,7 +15,7 @@ from pathlib import Path
 
 APP_NAME = "SRTMatcher"
 DISPLAY_NAME = "字幕多功能工具"
-APP_BUILD_ID = "2026-09-29-bugfix-installer-ui"
+APP_BUILD_ID = "2026-11-05-v0.2.0"
 DEFAULT_APP_HOME = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 APP_HOME = DEFAULT_APP_HOME
 APP_DIR = APP_HOME / "app"
