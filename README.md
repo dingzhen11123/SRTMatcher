@@ -47,7 +47,7 @@ NSIS 安装包只覆盖 `SRTMatcher.exe`、图标和 `app\ffmpeg.exe`，并删�
 启动器带有构建版本标记：
 
 ```python
-APP_BUILD_ID = "2026-09-29-bugfix-installer-ui"
+APP_BUILD_ID = "2026-11-05-v0.2.0"
 ```
 
 启动时会检查 `安装目录\.runtime-ready`。marker 中的版本标记，加上 `bootstrap.SOURCE_FILES` 里所有文件（全部 Python 模块、`requirements.txt`、`README.md`、图标等）的 SHA-256 指纹，都与启动器内置版本一致时，直接启动主程序。否则打开“正在更新”窗口，依次执行：
