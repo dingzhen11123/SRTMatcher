@@ -3,6 +3,37 @@ from __future__ import annotations
 import threading
 from urllib.parse import urlsplit
 
+ERROR_DETAIL_LIMIT = 500
+RETRYABLE_STATUS_CODES = {408, 429}
+
+
+class AIRequestError(RuntimeError):
+    """HTTP/network failure talking to the AI endpoint.
+
+    ``status_code`` is None for network errors (timeout, connection reset ...).
+    ``retryable`` marks transient failures worth retrying with backoff.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+def redact_secret(text: str, secret: str) -> str:
+    text = str(text or "")
+    secret = (secret or "").strip()
+    if secret and len(secret) >= 4:
+        text = text.replace(secret, "***")
+    return text
+
+
+def error_detail(text: str, secret: str, limit: int = ERROR_DETAIL_LIMIT) -> str:
+    detail = redact_secret(text, secret).strip()
+    if len(detail) > limit:
+        detail = detail[:limit] + " ...(已截断)"
+    return detail
+
 
 class AITransport:
     """Reusable HTTP transport for OpenAI-compatible endpoints."""
@@ -36,26 +67,44 @@ class AITransport:
     ) -> dict:
         import httpx
 
+        # 换行等非法字符会让 HTTP 库把整个请求头（含密钥，且已转义、脱敏匹配不到）写进异常。
+        if not (api_key.isascii() and api_key.isprintable()):
+            raise AIRequestError("API Key 含有换行、控制字符或非英文字符，请在设置页重新粘贴。请求未发送。")
         client = self._client_for(endpoint)
-        response = client.post(
-            endpoint,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=httpx.Timeout(timeout),
-        )
+        try:
+            response = client.post(
+                endpoint,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(timeout),
+            )
+        except httpx.TimeoutException as exc:
+            raise AIRequestError(
+                f"AI API 请求超时（{timeout}s）：{error_detail(str(exc), api_key)}",
+                retryable=True,
+            ) from None
+        except httpx.TransportError as exc:
+            raise AIRequestError(
+                f"AI API 网络连接失败：{error_detail(str(exc) or type(exc).__name__, api_key)}",
+                retryable=True,
+            ) from None
         if response.is_redirect:
-            raise RuntimeError(
-                f"AI API 返回了重定向 HTTP {response.status_code}，已拒绝转发密钥。"
+            raise AIRequestError(
+                f"AI API 返回了重定向 HTTP {response.status_code}，已拒绝转发密钥。",
+                status_code=response.status_code,
             )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = response.text[:4000]
-            raise RuntimeError(
-                f"AI API 请求失败：HTTP {response.status_code} {detail}"
+            status = response.status_code
+            detail = error_detail(response.text, api_key)
+            raise AIRequestError(
+                f"AI API 请求失败：HTTP {status} {detail}",
+                status_code=status,
+                retryable=status in RETRYABLE_STATUS_CODES or status >= 500,
             ) from exc
         try:
             data = response.json()

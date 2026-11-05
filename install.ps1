@@ -4,11 +4,15 @@ Set-Location -LiteralPath $PSScriptRoot
 
 if (-not (Test-Path -LiteralPath ".\.venv\Scripts\python.exe")) {
     python -m venv .venv
+    if ($LASTEXITCODE -ne 0) { throw "python -m venv failed" }
 }
 
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 .\.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0+cu128 torchaudio==2.8.0+cu128 torchvision==0.23.0+cu128
+if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 $scipyDistn = ".\.venv\Lib\site-packages\scipy\stats\_distn_infrastructure.py"
 if (Test-Path -LiteralPath $scipyDistn) {

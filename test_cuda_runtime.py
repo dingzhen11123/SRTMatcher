@@ -56,7 +56,12 @@ class CudaRuntimeTests(unittest.TestCase):
             calls.append(device)
             if device == "cuda":
                 raise RuntimeError("CUDA error: no kernel image is available for execution on the device")
-            return {"segments": transcript}
+            return {
+                "segments": [
+                    dict(item, words=[{"word": item["text"], "start": item["start"], "end": item["end"]}])
+                    for item in transcript
+                ]
+            }
 
         fake_whisperx = SimpleNamespace(
             load_align_model=lambda language_code, device: (object(), {"language": language_code}),

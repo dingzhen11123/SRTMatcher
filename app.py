@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from ai_transport import AI_TRANSPORT
+from ai_transport import AI_TRANSPORT, AIRequestError
 from asr_runtime import normalize_performance_preset, transcribe_options
 from batch_runtime import select_requested_media
 from model_runtime import MODEL_RUNTIME
@@ -26,6 +26,7 @@ from task_runtime import (
     check_cancelled,
     current_cancellation_token,
     emit_task_event,
+    sleep_cancellable,
     task_context,
 )
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -44,6 +45,7 @@ APP_SETTING_KEYS = {
     "output_dir",
     "output_path",
     "output_path_custom",
+    "output_location",
     "output_format",
     "device",
     "compute_type",
@@ -62,6 +64,8 @@ APP_SETTING_KEYS = {
     "api_key",
     "ai_model",
     "system_prompt",
+    "ai_glossary",
+    "onset_lead",
     "batch_input_dir",
     "batch_output_dir",
     "batch_recursive",
@@ -142,9 +146,36 @@ install_hidden_subprocess_policy()
 
 def read_json_file(path: Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_bytes()
+    except OSError:
         return {}
+    # utf-8-sig 兼容记事本保存的 BOM；旧版/手工编辑的文件可能是 GBK。
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write via a temp file + os.replace so a crash never leaves a half-written file."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding=encoding)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_settings() -> dict:
@@ -159,10 +190,10 @@ def load_settings() -> dict:
 def save_settings(data: dict) -> Path:
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(data, ensure_ascii=False, indent=2)
-    SETTINGS_PATH.write_text(text, encoding="utf-8")
+    write_text_atomic(SETTINGS_PATH, text)
 
     try:
-        PORTABLE_SETTINGS_PATH.write_text(text, encoding="utf-8")
+        write_text_atomic(PORTABLE_SETTINGS_PATH, text)
     except OSError:
         pass
 
@@ -209,7 +240,8 @@ def run_capture(args: list[str], timeout: int = 20) -> tuple[int, str]:
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
         return proc.returncode, proc.stdout or ""
-    except FileNotFoundError:
+    except OSError:
+        # FileNotFoundError / PermissionError / WinError 等都视为命令不可用。
         return 127, ""
     except subprocess.TimeoutExpired as exc:
         return 124, exc.stdout or ""
@@ -317,7 +349,17 @@ def recommended_nvidia_downloads(cuda_version: str) -> dict:
     }
 
 
-def install_recommended_torch(log, python_exe: str | None = None) -> None:
+TORCH_INSTALL_TIMEOUT_SECONDS = 3 * 60 * 60
+
+
+def install_recommended_torch(
+    log, python_exe: str | None = None, timeout: float = TORCH_INSTALL_TIMEOUT_SECONDS
+) -> None:
+    if "torch" in sys.modules:
+        raise RuntimeError(
+            "当前进程已加载 PyTorch，Windows 会锁定其 DLL，无法在运行中修复/重装。"
+            "请先重启软件，重启后不要开始任何识别任务，直接执行修复。"
+        )
     python_exe = python_exe or sys.executable
     plan = recommended_runtime_plan()
     torch_plan = plan["torch"]
@@ -344,14 +386,31 @@ def install_recommended_torch(log, python_exe: str | None = None) -> None:
         creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        if line.strip():
-            log(line.rstrip())
-    code = proc.wait()
+    timed_out = threading.Event()
+
+    def kill_on_timeout() -> None:
+        timed_out.set()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(timeout, kill_on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        for line in proc.stdout:
+            if line.strip():
+                log(line.rstrip())
+        code = proc.wait()
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        raise RuntimeError(f"PyTorch CUDA 依赖安装超时（超过 {int(timeout // 60)} 分钟），已终止 pip。")
     if code != 0:
         raise RuntimeError(f"PyTorch CUDA 依赖安装失败，退出码: {code}")
 
-DEFAULT_SYSTEM_PROMPT = """# 角色
+_LEGACY_DEFAULT_SYSTEM_PROMPT = """# 角色
 你是一名中文/多语字幕校对员，服务于一个 AI 视频解说系统。上游的 ASR 语音识别结果常有同音错别字、错词、缺字多字、标点混乱等问题。你的任务是只做文本纠错，绝不改动时间轴与结构。
 
 # 任务
@@ -374,6 +433,69 @@ DEFAULT_SYSTEM_PROMPT = """# 角色
 逐行输出，每行格式严格为：序号|修正后文本
 - 行数与输入完全一致，序号与输入完全一致。
 - 不要输出表头、不要输出 Markdown、不要加代码块、不要在前后添加任何文字。"""
+
+DEFAULT_AI_MODEL = "gemini-3.8-flash"
+
+_PREVIOUS_DEFAULT_ROLE ="你是一名中文/多语字幕校对员，服务于一个 AI 视频解说系统。上游的 ASR 语音识别结果常有同音错别字、错词、专有名词拼错、缺字多字、标点混乱等问题。你的任务是只做文本纠错，绝不改动时间轴与结构。"
+_GLOSSARY_GUARD = "术语表只用于纠正明显的误识别；原文用词本身通顺合理时，不要替换成术语表中形近或音近的词。"
+_DEFAULT_ROLE = "你是一名专业的多语种字幕校对员。字幕由语音识别（ASR）从音频/视频自动生成，常见同音错别字、错词、专有名词拼错、缺字多字、标点混乱等问题。你的任务是只做文本纠错，让字幕忠实还原说话人的原话，绝不改动时间轴与结构。"
+
+DEFAULT_SYSTEM_PROMPT = """# 角色
+你是一名专业的多语种字幕校对员。字幕由语音识别（ASR）从音频/视频自动生成，常见同音错别字、错词、专有名词拼错、缺字多字、标点混乱等问题。你的任务是只做文本纠错，让字幕忠实还原说话人的原话，绝不改动时间轴与结构。
+
+# 输入说明
+- 请求可能包含【参考信息】（语言、主题、术语表）、【前文】、【后文】和【重点检查】，这些只用于理解上下文，不要输出。
+- 只校对【待校对条目】，每行格式为：序号|原始文本。文本是 ASR 识别结果，可能有错。
+- 一句话可能被切成相邻的几条字幕，结合前文、后文判断被切开的词。
+- 你看不到也不需要时间轴；时间轴由系统保管，与你无关。
+
+# 修正规则
+1. 只修正：同音/近音错别字、明显错词、专有名词/术语拼写、缺字或多字、明显的语音识别误判、必要的标点。
+2. 专有名词和术语优先按术语表写法统一；用户术语表优先级最高。同一名词全篇保持同一写法。术语表只用于纠正明显的误识别；原文用词本身通顺合理时，不要替换成术语表中形近或音近的词。
+3. 【重点检查】列出的是 ASR 置信度较低的词，最可能识别错，重点核对；其余内容除非明显错误，否则不改。
+4. 必须保持每条原意不变，不得改写润色、不得增删信息、不得翻译、不得改变语言；口语、语气词、重复、口头禅照常保留。
+5. 不合并、不拆分、不增加、不删除任何条目；输入多少条，输出多少条，序号原样保留、顺序不变。
+6. 拿不准的条目，原样输出该条文本，不要臆改。
+7. 不要输出任何解释、说明、空行或多余字符；系统在请求中指定的批次完成标记除外。
+
+# 尺度示例
+- 3|我们今天来聊一聊人工只能的发展 → 3|我们今天来聊一聊人工智能的发展（同音错字，要改）
+- 4|嗯，那个，其实我觉得吧还行 → 4|嗯，那个，其实我觉得吧还行（口语，原样保留）
+- 5|Wir haben das gestern im Bundes tag besprochen → 5|Wir haben das gestern im Bundestag besprochen（专有名词被切开，要改）
+- 6|这个方案成本很高，效果一般 → 6|这个方案成本很高，效果一般（没有错误，不要润色）
+
+# 输出格式
+逐行输出，每行格式严格为：序号|修正后文本
+- 行数与【待校对条目】完全一致，序号完全一致。
+- 不要输出表头、不要输出 Markdown、不要加代码块、不要在前后添加任何文字。"""
+
+
+def _prompt_fingerprint(value: str) -> str:
+    return re.sub(r"\s+", "", value or "")
+
+
+LEGACY_DEFAULT_PROMPT_FINGERPRINTS = {
+    _prompt_fingerprint(_LEGACY_DEFAULT_SYSTEM_PROMPT),
+    _prompt_fingerprint(
+        _LEGACY_DEFAULT_SYSTEM_PROMPT.replace("；系统在请求中指定的批次完成标记除外", "")
+    ),
+    # 2026-09-29 首版新默认提示词，角色描述仍沿用旧项目的“AI 视频解说系统”。
+    _prompt_fingerprint(
+        DEFAULT_SYSTEM_PROMPT.replace(_DEFAULT_ROLE, _PREVIOUS_DEFAULT_ROLE).replace(_GLOSSARY_GUARD, "")
+    ),
+    # 2026-09-29 第二版：还没有“术语表只用于纠正明显误识别”的约束。
+    _prompt_fingerprint(DEFAULT_SYSTEM_PROMPT.replace(_GLOSSARY_GUARD, "")),
+}
+assert _GLOSSARY_GUARD in DEFAULT_SYSTEM_PROMPT
+assert _DEFAULT_ROLE in DEFAULT_SYSTEM_PROMPT
+
+
+def resolve_system_prompt(value: object) -> str:
+    """Return the prompt to use; untouched copies of older defaults get the current one."""
+    text = str(value or "").strip()
+    if not text or _prompt_fingerprint(text) in LEGACY_DEFAULT_PROMPT_FINGERPRINTS:
+        return DEFAULT_SYSTEM_PROMPT
+    return text
 
 
 @dataclass
@@ -408,6 +530,17 @@ class WordTimestamp:
 class AICompletion:
     content: str
     finish_reason: str = ""
+
+
+@dataclass
+class AIGuidance:
+    """Per-file hints sent with every correction batch (read-only for the model)."""
+
+    language: str = ""
+    topic: str = ""
+    user_glossary: str = ""
+    glossary: str = ""
+    low_confidence: dict[int, list[str]] | None = None
 
 
 def add_cuda_dll_paths() -> None:
@@ -630,10 +763,19 @@ def extract_asr_tokens(segments: list[object]) -> tuple[str, list[Token]]:
         words = getattr(segment, "words", None) or []
 
         if words:
+            seg_start_raw = getattr(segment, "start", None)
+            seg_end_raw = getattr(segment, "end", None)
             for word in words:
                 word_text = getattr(word, "word", "") or ""
-                word_start = float(getattr(word, "start", getattr(segment, "start", 0.0)) or 0.0)
-                word_end = float(getattr(word, "end", getattr(segment, "end", word_start + 0.1)) or word_start + 0.1)
+                # 属性存在但为 None 时也要回退到片段时间，而不是 0.0。
+                raw_start = getattr(word, "start", None)
+                if raw_start is None:
+                    raw_start = seg_start_raw
+                word_start = float(raw_start or 0.0)
+                raw_end = getattr(word, "end", None)
+                if raw_end is None:
+                    raw_end = seg_end_raw
+                word_end = float(raw_end or word_start + 0.1)
                 sub_tokens = tokenize_text(word_text, keep_punctuation=False)
                 timed = distribute_times(sub_tokens, word_start, word_end)
                 for token in timed:
@@ -654,7 +796,12 @@ def extract_asr_tokens(segments: list[object]) -> tuple[str, list[Token]]:
     return "".join(full_text_parts).strip(), tokens
 
 
-def assign_script_times(script: str, asr_tokens: list[Token]) -> list[Token]:
+TRAILING_TOKEN_SECONDS = 0.15
+
+
+def assign_script_times(
+    script: str, asr_tokens: list[Token], audio_end: float | None = None
+) -> list[Token]:
     script_tokens = tokenize_text(script, keep_punctuation=True)
     script_alignable = [(idx, normalize_for_match(t.text)) for idx, t in enumerate(script_tokens) if t.alignable]
     asr_alignable = [(idx, normalize_for_match(t.text)) for idx, t in enumerate(asr_tokens) if normalize_for_match(t.text)]
@@ -702,8 +849,13 @@ def assign_script_times(script: str, asr_tokens: list[Token]) -> list[Token]:
         elif right is None:
             left_time = script_tokens[left].end_time or first_time
             span = len(script_tokens) - left
-            token.start_time = left_time + (last_time - left_time) * (idx - left - 1) / span
-            token.end_time = left_time + (last_time - left_time) * (idx - left) / span
+            # 最后一个匹配 token 之后的文稿没有 ASR 时间；若剩余时间几乎为 0，
+            # 按每个 token 约 TRAILING_TOKEN_SECONDS 估计时长，但不超过音频结尾。
+            tail_end = max(last_time, left_time + TRAILING_TOKEN_SECONDS * (span - 1))
+            if audio_end is not None and audio_end > 0:
+                tail_end = min(tail_end, max(last_time, float(audio_end)))
+            token.start_time = left_time + (tail_end - left_time) * (idx - left - 1) / span
+            token.end_time = left_time + (tail_end - left_time) * (idx - left) / span
         else:
             left_time = script_tokens[left].end_time or first_time
             right_time = script_tokens[right].start_time or last_time
@@ -878,9 +1030,12 @@ COMMON_ASR_HALLUCINATION_PHRASES = (
     "untertitel der amara org community",
     "subtitles by the amara org community",
     "subtitles by amara org",
-    "captions by",
     "sous titres realises par",
     "sous titrage societe radio canada",
+)
+# 过于通用的短语只在片段开头出现时才算伪字幕，避免误删正常句子。
+COMMON_ASR_HALLUCINATION_PREFIXES = (
+    "captions by",
 )
 
 
@@ -893,7 +1048,10 @@ def normalized_hallucination_text(text: str) -> str:
 def asr_hallucination_reason(segment: object) -> str:
     text = str(getattr(segment, "text", "") or "").strip()
     normalized = normalized_hallucination_text(text)
-    if any(phrase in normalized for phrase in COMMON_ASR_HALLUCINATION_PHRASES):
+    if any(phrase in normalized for phrase in COMMON_ASR_HALLUCINATION_PHRASES) or any(
+        normalized == prefix or normalized.startswith(prefix + " ")
+        for prefix in COMMON_ASR_HALLUCINATION_PREFIXES
+    ):
         return "命中常见片尾伪字幕"
 
     no_speech = getattr(segment, "no_speech_prob", None)
@@ -1001,27 +1159,36 @@ def format_timestamp(seconds: float) -> str:
 
 
 def srt_from_subtitles(subtitles: list[Subtitle]) -> str:
+    # SRT 序号按位置连续编号（1..n）；sub.index 只作内部标识，可能因删除空条目而不连续。
     blocks = []
-    for sub in subtitles:
+    for number, sub in enumerate(subtitles, start=1):
         text = f"[{sub.speaker}] {sub.text}" if sub.speaker else sub.text
         blocks.append(
-            f"{sub.index}\n{format_timestamp(sub.start)} --> {format_timestamp(sub.end)}\n{text}"
+            f"{number}\n{format_timestamp(sub.start)} --> {format_timestamp(sub.end)}\n{text}"
         )
     return "\n\n".join(blocks) + "\n"
 
 
 def repair_subtitle_text_boundaries(subtitles: list[Subtitle]) -> list[Subtitle]:
+    """Move leading punctuation to the previous cue and drop cues left empty.
+
+    ``sub.index`` is kept unchanged (word timestamps and AI mappings are keyed by
+    it); exported SRT/word numbering is positional, so dropped cues leave no gaps.
+    """
     repaired: list[Subtitle] = []
     leading_punctuation = set(".,;:!?，。！？；：、")
     for sub in subtitles:
         text = sub.text.strip()
-        moved = ""
-        while text and text[0] in leading_punctuation:
-            moved += text[0]
-            text = text[1:].lstrip()
-        if moved and repaired:
-            previous = repaired[-1]
-            repaired[-1] = Subtitle(previous.index, previous.start, previous.end, f"{previous.text.rstrip()}{moved}", previous.speaker)
+        if repaired:
+            moved = ""
+            while text and text[0] in leading_punctuation:
+                moved += text[0]
+                text = text[1:].lstrip()
+            if moved:
+                previous = repaired[-1]
+                repaired[-1] = Subtitle(previous.index, previous.start, previous.end, f"{previous.text.rstrip()}{moved}", previous.speaker)
+        if not text:
+            continue
         repaired.append(Subtitle(sub.index, sub.start, sub.end, text, sub.speaker))
     return repaired
 
@@ -1054,19 +1221,77 @@ def repair_subtitle_timings(
                     start = previous.end + min_gap
                 end = max(start + min_duration, end)
 
-        if audio_end is not None and audio_end > 0:
-            end = min(end, audio_end)
-            if start >= end:
-                start = max(0.0, end - min_duration)
-                if repaired and start < repaired[-1].end + min_gap:
-                    start = repaired[-1].end + min_gap
-                    end = max(end, start + min_duration)
-
         if abs(start - original[0]) > 0.001 or abs(end - original[1]) > 0.001:
             changes += 1
         repaired.append(Subtitle(sub.index, start, max(start + min_duration, end), sub.text, sub.speaker))
 
+    if audio_end is not None and audio_end > 0 and repaired[-1].end > audio_end + 1e-6:
+        before = [(sub.start, sub.end) for sub in repaired]
+        repaired = compress_subtitle_tail(repaired, float(audio_end), min_duration, min_gap)
+        changes += sum(
+            1
+            for (old_start, old_end), sub in zip(before, repaired)
+            if abs(sub.start - old_start) > 0.001 or abs(sub.end - old_end) > 0.001
+        )
+
     return repaired, changes
+
+
+def compress_subtitle_tail(
+    subtitles: list[Subtitle],
+    audio_end: float,
+    min_duration: float = 0.12,
+    min_gap: float = 0.02,
+) -> list[Subtitle]:
+    """Squeeze the tail so no cue ends after ``audio_end``.
+
+    Input must already be monotonic and non-overlapping.  The smallest tail that
+    has room for ``min_duration + min_gap`` per cue is laid out again in the window
+    ending at ``audio_end``: every cue keeps ``min_duration`` and every gap keeps
+    ``min_gap``, and only the time above those floors is shrunk.  If even the whole
+    list has no such room, every cue is scaled linearly into ``[0, audio_end]``.
+    """
+    if not subtitles or subtitles[-1].end <= audio_end:
+        return subtitles
+    count = len(subtitles)
+
+    def room_needed(first: int) -> float:
+        return (count - first) * (min_duration + min_gap)
+
+    first = next(i for i, sub in enumerate(subtitles) if sub.end > audio_end)
+    while first > 0 and audio_end - subtitles[first].start < room_needed(first):
+        first -= 1
+    source_start = subtitles[first].start
+    target_start = max(0.0, min(source_start, audio_end - room_needed(first)))
+    tail = subtitles[first:]
+    available = audio_end - target_start
+    required = len(tail) * min_duration + (len(tail) - 1) * min_gap
+    compressed = list(subtitles[:first])
+
+    if available < required:
+        source_end = subtitles[-1].end
+        scale = available / max(1e-9, source_end - source_start)
+
+        def mapped(value: float) -> float:
+            return min(audio_end, max(0.0, target_start + (value - source_start) * scale))
+
+        for sub in tail:
+            compressed.append(Subtitle(sub.index, mapped(sub.start), mapped(sub.end), sub.text, sub.speaker))
+        return compressed
+
+    spare_durations = [max(0.0, sub.end - sub.start - min_duration) for sub in tail]
+    spare_gaps = [max(0.0, cur.start - prev.end - min_gap) for prev, cur in zip(tail, tail[1:])]
+    total_spare = sum(spare_durations) + sum(spare_gaps)
+    factor = min(1.0, (available - required) / total_spare) if total_spare > 0 else 0.0
+
+    cursor = target_start
+    for position, sub in enumerate(tail):
+        if position:
+            cursor += min_gap + spare_gaps[position - 1] * factor
+        end = min(audio_end, cursor + min_duration + spare_durations[position] * factor)
+        compressed.append(Subtitle(sub.index, cursor, end, sub.text, sub.speaker))
+        cursor = end
+    return compressed
 
 
 def replace_subtitle_texts(subtitles: list[Subtitle], mapping: dict[int, str]) -> list[Subtitle]:
@@ -1105,13 +1330,18 @@ def disable_torch_cuda_for_process() -> None:
     global _TORCH_CUDA_DISABLED_FOR_PROCESS, _TORCH_CUDA_PROBE_RESULT
     _TORCH_CUDA_DISABLED_FOR_PROCESS = True
     _TORCH_CUDA_PROBE_RESULT = False
+    # 丢弃所有语言的 CUDA 对齐模型和 CUDA 说话人模型，否则它们会一直占用显存。
+    try:
+        MODEL_RUNTIME.release_device("cuda")
+    except Exception:
+        pass
+    gc.collect()
     try:
         import torch
 
         torch.cuda.empty_cache()
     except Exception:
         pass
-    gc.collect()
 
 
 def torch_cuda_usable_in_process(log) -> bool:
@@ -1150,6 +1380,54 @@ def resolve_torch_device(device_choice: str, log) -> str:
     if wants_cuda:
         log("WhisperX / 说话人识别的 PyTorch CUDA 未通过真实运算检测，将使用 CPU。ASR 的 CTranslate2 CUDA 不受影响。")
     return "cpu"
+
+
+WHISPERX_ONSET_PULLBACK_MAX = 0.5
+DEFAULT_ONSET_LEAD = 0.10
+
+
+def apply_onset_lead(
+    subtitles: list[Subtitle], lead: float = DEFAULT_ONSET_LEAD, min_gap: float = 0.02
+) -> tuple[list[Subtitle], int]:
+    """Start each cue slightly before the detected onset so sliced clips keep the first syllable.
+
+    The extra lead never overlaps the previous cue (keeps ``min_gap``) and never goes below 0.
+    """
+    if lead <= 0 or not subtitles:
+        return subtitles, 0
+    result: list[Subtitle] = []
+    changed = 0
+    for sub in subtitles:
+        floor = result[-1].end + min_gap if result else 0.0
+        start = max(floor, sub.start - lead)
+        if start < sub.start - 0.0005:
+            changed += 1
+            result.append(Subtitle(sub.index, start, sub.end, sub.text, sub.speaker))
+        else:
+            result.append(sub)
+    return result, changed
+
+
+def onset_lead_from_config(config: dict) -> float:
+    try:
+        value = float(config.get("onset_lead", DEFAULT_ONSET_LEAD))
+    except (TypeError, ValueError):
+        return DEFAULT_ONSET_LEAD
+    return min(max(value, 0.0), 1.0)
+
+
+def whisperx_piece_has_timed_word(piece: dict) -> bool:
+    for item in piece.get("words", []) or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            if item.get("start") is not None and item.get("end") is not None:
+                float(item["start"])
+                float(item["end"])
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def run_whisperx_alignment(
@@ -1240,15 +1518,27 @@ def run_whisperx_alignment(
         improved = 0
         for sub in subtitles:
             pieces = grouped.get(sub.index, [])
-            starts = [float(piece["start"]) for piece in pieces if piece.get("start") is not None]
-            ends = [float(piece["end"]) for piece in pieces if piece.get("end") is not None]
+            # WhisperX 对齐失败时会原样返回带 padding 的输入窗口且没有带时间的 words；
+            # 只有至少一个词同时有 start/end 的片段才算真正对齐。
+            timed_pieces = [piece for piece in pieces if whisperx_piece_has_timed_word(piece)]
+            starts = [float(piece["start"]) for piece in timed_pieces if piece.get("start") is not None]
+            ends = [float(piece["end"]) for piece in timed_pieces if piece.get("end") is not None]
             if starts and ends:
                 start = max(0.0, min(starts))
+                # wav2vec2 的 CTC 对齐普遍把句首标晚 0.1–0.3s，切片时会吃掉第一个音节；
+                # 对齐前的起点离得不远时以更早的那个为准。
+                if sub.start < start <= sub.start + WHISPERX_ONSET_PULLBACK_MAX:
+                    start = max(0.0, sub.start)
                 end = max(start + 0.08, max(ends))
                 aligned.append(Subtitle(sub.index, start, end, sub.text, sub.speaker))
                 improved += 1
             else:
                 aligned.append(sub)
+                if pieces:
+                    log(f"WhisperX 未能对齐句级字幕 {sub.index}（没有带时间的词），保留原时间轴。")
+                word_timestamps[sub.index] = None
+                log(f"逐词时间戳缺失: 句级字幕 {sub.index} 未获得 words 对齐结果。")
+                continue
 
             words: list[WordTimestamp] = []
             for piece in pieces:
@@ -1280,8 +1570,10 @@ def run_whisperx_alignment(
         attempted_device = locals().get("device")
         if attempted_device == "cuda" and is_torch_cuda_runtime_error(exc):
             log(f"WhisperX CUDA 与当前显卡/运行库不兼容，自动切换 CPU 重试: {exc}")
+            for key in [key for key in align_model_cache if len(key) > 1 and key[1] == "cuda"]:
+                align_model_cache.pop(key, None)
+            align_model = metadata = result = None  # 释放本帧对 CUDA 模型/张量的引用
             disable_torch_cuda_for_process()
-            align_model_cache.pop((language_code, "cuda"), None)
             return run_whisperx_alignment(
                 audio_path,
                 subtitles,
@@ -1316,33 +1608,38 @@ def repair_word_timestamps(
             repaired[sentence_id] = None
             continue
 
-        timed = [word for word in source_words if word.start is not None and word.end is not None]
-        untimed = [word for word in source_words if word.start is None or word.end is None]
-        timed.sort(key=lambda word: (float(word.start), float(word.end)))
+        # 保持原始词序：无时间或被夹断的词留在原位置（时间置 None），不挪到末尾。
         normalized: list[WordTimestamp] = []
-        for word in timed:
+        previous_timed: int | None = None
+        untimed_count = 0
+        for word in source_words:
+            if word.start is None or word.end is None:
+                normalized.append(WordTimestamp(sentence_id, word.word, None, None, word.score))
+                untimed_count += 1
+                continue
             start = min(sentence.end, max(sentence.start, float(word.start)))
             end = min(sentence.end, max(start + 0.001, float(word.end)))
-            if normalized and start < float(normalized[-1].end):
-                previous = normalized[-1]
+            if previous_timed is not None and start < float(normalized[previous_timed].end):
+                previous = normalized[previous_timed]
                 boundary = min(
                     sentence.end,
                     max(float(previous.start) + 0.001, (float(previous.end) + start) / 2),
                 )
-                normalized[-1] = WordTimestamp(
+                normalized[previous_timed] = WordTimestamp(
                     previous.sentence_id, previous.word, previous.start, boundary, previous.score
                 )
                 start = boundary
                 end = min(sentence.end, max(start + 0.001, end))
             if start >= sentence.end or end <= start:
-                untimed.append(WordTimestamp(sentence_id, word.word, None, None, word.score))
+                normalized.append(WordTimestamp(sentence_id, word.word, None, None, word.score))
+                untimed_count += 1
                 continue
             normalized.append(WordTimestamp(sentence_id, word.word, start, end, word.score))
+            previous_timed = len(normalized) - 1
 
-        normalized.extend(untimed)
         repaired[sentence_id] = normalized or None
-        if untimed:
-            log(f"逐词时间戳校验: 句级字幕 {sentence_id} 有 {len(untimed)} 个词/字无法形成有效时间区间。")
+        if untimed_count:
+            log(f"逐词时间戳校验: 句级字幕 {sentence_id} 有 {untimed_count} 个词/字无法形成有效时间区间。")
     return repaired
 
 
@@ -1366,14 +1663,15 @@ def export_word_timestamps(
     target.parent.mkdir(parents=True, exist_ok=True)
     if export_format == "json":
         rows: list[dict] = []
-        for sub in subtitles:
+        # sentence_id 与导出的 SRT 序号一致（按位置 1..n），words 仍按 sub.index 查找。
+        for sentence_id, sub in enumerate(subtitles, start=1):
             words = word_timestamps.get(sub.index)
             if not words:
-                rows.append({"sentence_id": sub.index, "words": None})
+                rows.append({"sentence_id": sentence_id, "words": None})
                 continue
             for word in words:
                 row = {
-                    "sentence_id": sub.index,
+                    "sentence_id": sentence_id,
                     "word": word.word,
                     "start": round(word.start, 6) if word.start is not None else None,
                     "end": round(word.end, 6) if word.end is not None else None,
@@ -1590,8 +1888,13 @@ def download_faster_whisper_model(
         "vocabulary.*",
     ]
 
+    # huggingface_hub 可能在工作线程里更新进度，ContextVar 不会跟过去，所以提前取出 token。
+    cancel_token = current_cancellation_token()
+
     class GuiTqdm(tqdm):
         def update(self, n=1):
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
             result = super().update(n)
             if progress and self.total:
                 ratio = min(1.0, max(0.0, float(self.n) / float(self.total)))
@@ -1602,6 +1905,7 @@ def download_faster_whisper_model(
     if progress:
         progress(progress_start, "准备下载模型 ...")
     log(f"从 Hugging Face 下载模型: {repo_id}")
+    check_cancelled()
     return snapshot_download(
         repo_id,
         local_dir=str(output_dir),
@@ -1625,15 +1929,18 @@ def prepare_model_files(model_path: str, log, progress=None) -> str:
         return str(path)
     if path.is_file():
         raise RuntimeError("faster-whisper 需要选择模型目录，不是单独的 model.bin 文件。")
+    # 与界面上的 model_file_status(...)["ready"] 使用同一套完整性判断（含 vocabulary.*）。
+    status = model_file_status(str(path))
+    if status["ready"]:
+        return str(path)
     if (path / "model.bin").exists():
-        missing = [name for name in MODEL_SIDEcar_FILES[:3] if not (path / name).exists()]
-        if missing:
-            log("当前目录只有部分模型文件，缺少: " + ", ".join(missing))
-            log("尝试从 faster-whisper 的 large-v3-turbo 仓库补齐小文件 ...")
-            download_faster_whisper_model(DEFAULT_MODEL_REPO, path, log, progress, 5, 98)
-            log("模型文件补齐完成。")
-            if progress:
-                progress(100, "模型文件补齐完成")
+        missing = [item["label"] for item in status["files"] if not item["ok"]]
+        log("当前目录只有部分模型文件，缺少: " + ", ".join(missing))
+        log("尝试从 faster-whisper 的 large-v3-turbo 仓库补齐小文件 ...")
+        download_faster_whisper_model(DEFAULT_MODEL_REPO, path, log, progress, 5, 98)
+        log("模型文件补齐完成。")
+        if progress:
+            progress(100, "模型文件补齐完成")
     else:
         log(f"模型目录缺少 model.bin，将自动下载到: {path}")
         download_faster_whisper_model(DEFAULT_MODEL_REPO, path, log, progress, 5, 98)
@@ -1673,6 +1980,8 @@ def run_srt_job(config: dict, log, progress=None) -> str:
     effective_mode = "align" if (mode == "align" or (mode == "auto" and script)) else "transcribe"
     if effective_mode == "align" and not script:
         raise RuntimeError("文稿精对齐模式需要粘贴文稿或选择 TXT 文件。")
+    diarization_enabled = bool(config.get("diarization_enabled", False))
+    diarization_settings = validate_diarization_settings(config) if diarization_enabled else None
 
     add_cuda_dll_paths()
     from faster_whisper import WhisperModel
@@ -1712,13 +2021,14 @@ def run_srt_job(config: dict, log, progress=None) -> str:
     )
     detected_language = getattr(info, "language", "unknown")
     log(f"识别语言: {detected_language}，片段数: {len(segments)}")
+    audio_end = max((float(getattr(segment, "end", 0.0) or 0.0) for segment in segments), default=None)
 
     if effective_mode == "align":
         _, asr_tokens = extract_asr_tokens(segments)
         if not asr_tokens:
             raise RuntimeError("没有提取到可对齐的 ASR token。")
         log(f"ASR token: {len(asr_tokens)}，开始匹配文稿 ...")
-        script_tokens = assign_script_times(script, asr_tokens)
+        script_tokens = assign_script_times(script, asr_tokens, audio_end=audio_end)
         line_count = len(script_line_ranges(script))
         if line_count > 1:
             log(f"检测到文稿非空行: {line_count}，按文稿行生成 SRT。")
@@ -1739,14 +2049,18 @@ def run_srt_job(config: dict, log, progress=None) -> str:
         align_language = language if language and language.lower() != "auto" else detected_language
         subtitles, word_timestamps = run_whisperx_alignment(audio, subtitles, align_language, device, log)
 
+    subtitles = repair_subtitle_text_boundaries(subtitles)
     if not subtitles:
         raise RuntimeError("没有生成可用字幕条目，请检查音频是否可识别。")
-    audio_end = max((float(getattr(segment, "end", 0.0) or 0.0) for segment in segments), default=None)
-    subtitles = repair_subtitle_text_boundaries(subtitles)
     subtitles, repaired_timing_count = repair_subtitle_timings(subtitles, audio_end=audio_end)
     if repaired_timing_count:
         log(f"已整理时间轴，修复重叠/回退: {repaired_timing_count} 处。")
+    onset_lead = onset_lead_from_config(config)
+    subtitles, lead_count = apply_onset_lead(subtitles, onset_lead)
+    if lead_count:
+        log(f"字幕起点前留 {onset_lead:.2f}s 余量: {lead_count} 条（不与上一条重叠），避免切片丢失句首。")
     log(f"生成字幕条目: {len(subtitles)}")
+    texts_before_ai = {sub.index: sub.text for sub in subtitles}
     if bool(config.get("ai_enabled", True)):
         check_cancelled()
         emit_task_event("stage", stage="ai", label="AI 校对")
@@ -1758,6 +2072,17 @@ def run_srt_job(config: dict, log, progress=None) -> str:
         if not api_key or not base_url or not ai_model:
             raise RuntimeError("启用 AI 修正/校对前，请先配置 API Key、Base URL 和模型名。")
         log("AI 校对文稿字幕 ..." if effective_mode == "align" else "AI 修正 ASR 字幕 ...")
+        guidance = build_ai_guidance(
+            subtitles,
+            base_url,
+            api_key,
+            ai_model,
+            log,
+            language=language if language and language.lower() != "auto" else detected_language,
+            user_glossary=str(config.get("ai_glossary", "")),
+            # 文稿模式的字幕文字来自用户文稿，ASR 置信度与其无关。
+            segments=segments if effective_mode == "transcribe" else None,
+        )
         subtitles = correct_subtitles_with_ai(
             subtitles,
             base_url,
@@ -1765,44 +2090,103 @@ def run_srt_job(config: dict, log, progress=None) -> str:
             ai_model,
             str(config.get("system_prompt", "")).strip() or DEFAULT_SYSTEM_PROMPT,
             log,
+            guidance=guidance,
         )
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)
-    if bool(config.get("diarization_enabled", False)):
-        check_cancelled()
-        emit_task_event("stage", stage="speaker", label="说话人识别")
-        speaker_turns = run_speaker_diarization(
-            audio,
-            str(config.get("hf_token", "")).strip(),
-            device,
-            parse_optional_int(str(config.get("min_speakers", "")).strip()),
-            parse_optional_int(str(config.get("max_speakers", "")).strip()),
-            log,
-        )
-        subtitles = assign_speakers_to_subtitles(subtitles, speaker_turns)
-        subtitles, repaired_timing_count = repair_subtitle_timings(subtitles, audio_end=audio_end)
-        if repaired_timing_count:
-            log(f"说话人识别后再次整理时间轴: {repaired_timing_count} 处。")
-
     check_cancelled()
     emit_task_event("stage", stage="export", label="导出结果")
     if progress:
         progress(94, "正在导出结果 ...")
-    if output_format == "txt":
-        output_text = transcript_text_from_subtitles(subtitles)
-    else:
-        output_text = srt_from_subtitles(subtitles)
-    Path(output).write_text(output_text, encoding="utf-8-sig")
+
+    def write_main_output(items: list[Subtitle]) -> None:
+        if output_format == "txt":
+            output_text = transcript_text_from_subtitles(items)
+        else:
+            output_text = srt_from_subtitles(items)
+        Path(output).write_text(output_text, encoding="utf-8-sig")
+
+    # 先保存主字幕（不含说话人），说话人识别失败时不会丢掉已完成的 ASR/AI 结果。
+    write_main_output(subtitles)
+    log(f"{output_format.upper()} 已保存: {output}")
     if word_export != "none":
         word_timestamps = repair_word_timestamps(subtitles, word_timestamps, log)
+        warn_words_predate_ai_correction(subtitles, texts_before_ai, word_timestamps, log)
         export_word_timestamps(subtitles, word_timestamps, output, word_export, log)
-    if bool(config.get("diarization_enabled", False)):
+
+    if diarization_settings is not None:
+        hf_token, min_speakers, max_speakers = diarization_settings
+        check_cancelled()
+        emit_task_event("stage", stage="speaker", label="说话人识别")
+        try:
+            speaker_turns = run_speaker_diarization(
+                audio, hf_token, device, min_speakers, max_speakers, log,
+            )
+        except TaskCancelled:
+            log(f"说话人识别已取消，主字幕（不含说话人）已保存到: {output}")
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"说话人识别失败：{exc}\n主字幕（不含说话人）已保存到: {output}"
+            ) from exc
+        subtitles = assign_speakers_to_subtitles(subtitles, speaker_turns)
+        subtitles, repaired_timing_count = repair_subtitle_timings(subtitles, audio_end=audio_end)
+        if repaired_timing_count:
+            log(f"说话人识别后再次整理时间轴: {repaired_timing_count} 处。")
+        check_cancelled()
+        write_main_output(subtitles)
+        log(f"{output_format.upper()} 已更新说话人标签: {output}")
         export_speaker_files(subtitles, output, log)
-    log(f"{output_format.upper()} 已保存: {output}")
+
     emit_task_event("stage", stage="done", label="已完成")
     if progress:
         progress(100, f"{output_format.upper()} 已完成")
     return output
+
+
+def validate_diarization_settings(config: dict) -> tuple[str, int | None, int | None]:
+    """Check speaker-diarization inputs before any expensive ASR work starts."""
+    hf_token = str(config.get("hf_token", "") or "").strip()
+    if not hf_token:
+        raise RuntimeError(
+            "启用说话人识别前，请在 设置 -> 说话人模型 填写 Hugging Face Token，并确认已同意 pyannote 模型许可。"
+        )
+    parsed: dict[str, int | None] = {}
+    for key, label in (("min_speakers", "最少说话人数"), ("max_speakers", "最多说话人数")):
+        raw = str(config.get(key, "") or "").strip()
+        try:
+            parsed[key] = parse_optional_int(raw)
+        except ValueError:
+            raise RuntimeError(f"{label}必须是整数或留空，当前为“{raw}”。") from None
+    min_speakers, max_speakers = parsed["min_speakers"], parsed["max_speakers"]
+    if min_speakers is not None and max_speakers is not None and min_speakers > max_speakers:
+        raise RuntimeError(f"最少说话人数（{min_speakers}）不能大于最多说话人数（{max_speakers}）。")
+    return hf_token, min_speakers, max_speakers
+
+
+def warn_words_predate_ai_correction(
+    subtitles: list[Subtitle],
+    texts_before_ai: dict[int, str],
+    word_timestamps: dict[int, list[WordTimestamp] | None],
+    log,
+) -> None:
+    """Log once when AI changed sentences whose word timings came from the old text."""
+    changed = [
+        position
+        for position, sub in enumerate(subtitles, start=1)
+        if word_timestamps.get(sub.index)
+        and sub.index in texts_before_ai
+        and texts_before_ai[sub.index] != sub.text
+    ]
+    if not changed:
+        return
+    preview = ", ".join(str(position) for position in changed[:10])
+    if len(changed) > 10:
+        preview += " ..."
+    log(
+        f"注意: AI 校对修改了 {len(changed)} 条字幕的文字（句 {preview}），"
+        "这些句子的逐词时间戳仍对应校对前的识别文本。"
+    )
 
 
 def discover_batch_media(input_dir: str, recursive: bool = True) -> list[Path]:
@@ -1845,14 +2229,28 @@ def batch_output_paths(
     for candidate in candidates.values():
         key = str(candidate).casefold()
         counts[key] = counts.get(key, 0) + 1
+    # 未冲突的文件保留自然文件名；冲突的改用“原名+扩展名”，再按 Windows 不区分大小写
+    # 的规则复查一次，仍冲突时追加 _2、_3 …直到唯一。
     resolved: dict[Path, Path] = {}
+    used: set[str] = set()
+    renamed: list[tuple[Path, Path]] = []
     for media_path, candidate in candidates.items():
         if counts[str(candidate).casefold()] > 1:
-            candidate = candidate.with_name(
-                f"{media_path.stem}{media_path.suffix.lower()}.{extension}"
+            renamed.append(
+                (media_path, candidate.with_name(f"{media_path.stem}{media_path.suffix.lower()}.{extension}"))
             )
-        resolved[media_path] = candidate
-    return resolved
+        else:
+            resolved[media_path] = candidate
+            used.add(str(candidate).casefold())
+    for media_path, candidate in renamed:
+        unique = candidate
+        number = 2
+        while str(unique).casefold() in used:
+            unique = candidate.with_name(f"{candidate.stem}_{number}{candidate.suffix}")
+            number += 1
+        used.add(str(unique).casefold())
+        resolved[media_path] = unique
+    return {media_path: resolved[media_path] for media_path in candidates}
 
 
 def plain_text_from_subtitles(subtitles: list[Subtitle]) -> str:
@@ -1888,6 +2286,7 @@ def run_batch_txt_job(config: dict, log, progress=None) -> str:
     api_key = str(config.get("api_key", "")).strip()
     ai_model = str(config.get("ai_model", "")).strip()
     system_prompt = str(config.get("system_prompt", "")).strip() or DEFAULT_SYSTEM_PROMPT
+    user_glossary = str(config.get("ai_glossary", ""))
     performance_preset = normalize_performance_preset(
         str(config.get("performance_preset", "recommended"))
     )
@@ -1979,6 +2378,10 @@ def run_batch_txt_job(config: dict, log, progress=None) -> str:
                 f"ASR 片段: {len(subtitles)}，开始 LLM 纠错 ..."
             )
             emit_task_event("stage", stage="ai", label=f"AI 校对 {position}/{total}")
+            guidance = build_ai_guidance(
+                subtitles, base_url, api_key, ai_model, log,
+                language=detected_language, user_glossary=user_glossary, segments=segments,
+            )
             subtitles = correct_subtitles_with_ai(
                 subtitles,
                 base_url,
@@ -1986,6 +2389,7 @@ def run_batch_txt_job(config: dict, log, progress=None) -> str:
                 ai_model,
                 system_prompt,
                 log,
+                guidance=guidance,
             )
             text = plain_text_from_subtitles(subtitles)
             if not text.strip():
@@ -2041,6 +2445,7 @@ def run_batch_txt_job(config: dict, log, progress=None) -> str:
 
 
 def run_batch_srt_job(config: dict, log, progress=None) -> str:
+    onset_lead = onset_lead_from_config(config)
     check_cancelled()
     input_value = str(config.get("batch_input_dir", "")).strip()
     if not input_value:
@@ -2057,6 +2462,7 @@ def run_batch_srt_job(config: dict, log, progress=None) -> str:
     api_key = str(config.get("api_key", "")).strip()
     ai_model = str(config.get("ai_model", "")).strip()
     system_prompt = str(config.get("system_prompt", "")).strip() or DEFAULT_SYSTEM_PROMPT
+    user_glossary = str(config.get("ai_glossary", ""))
     performance_preset = normalize_performance_preset(
         str(config.get("performance_preset", "recommended"))
     )
@@ -2165,8 +2571,13 @@ def run_batch_srt_job(config: dict, log, progress=None) -> str:
             subtitles, repaired_count = repair_subtitle_timings(subtitles, audio_end=audio_end)
             if repaired_count:
                 log(f"[{position}/{total}] 精对齐后整理时间轴: {repaired_count} 处。")
+            subtitles, _lead_count = apply_onset_lead(subtitles, onset_lead)
             log(f"[{position}/{total}] WhisperX 完成，开始 LLM 纠错 ...")
             emit_task_event("stage", stage="ai", label=f"AI 校对 {position}/{total}")
+            guidance = build_ai_guidance(
+                subtitles, base_url, api_key, ai_model, log,
+                language=detected_language, user_glossary=user_glossary, segments=segments,
+            )
             subtitles = correct_subtitles_with_ai(
                 subtitles,
                 base_url,
@@ -2174,6 +2585,7 @@ def run_batch_srt_job(config: dict, log, progress=None) -> str:
                 ai_model,
                 system_prompt,
                 log,
+                guidance=guidance,
             )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             emit_task_event("stage", stage="export", label=f"导出 {position}/{total}")
@@ -2255,25 +2667,68 @@ def call_openai_compatible(
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise RuntimeError("AI API 返回缺少 choices[0]。")
     choice = choices[0]
-    content = choice.get("message", {}).get("content", "")
+    message = choice.get("message")
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if content is None and isinstance(choice.get("text"), str):
+        content = choice.get("text")
     return AICompletion(
-        content=str(content or "").strip(),
+        content=completion_content_text(content).strip(),
         finish_reason=str(choice.get("finish_reason") or "").strip(),
     )
 
 
+def completion_content_text(content: object) -> str:
+    """Normalize ``message.content``: None, plain string, or a list of content parts."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, dict):
+                    text = text.get("value")
+                if isinstance(text, str) and part.get("type", "text") in {"text", "output_text"}:
+                    parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
+_INVISIBLE_CHARS = dict.fromkeys(map(ord, "\ufeff\u200b\u200c\u200d\u2060"), None)
+# \u6b63\u6587\u91cc\u7684 U+200C/U+200D \u662f\u6709\u6548\u5b57\u7b26\uff08\u6ce2\u65af\u8bed\u534a\u7a7a\u683c\u3001\u7ec4\u5408\u8868\u60c5\uff09\uff0c\u53ea\u80fd\u5728\u5e8f\u53f7\u548c\u884c\u9996\u5c3e\u6e05\u7406\u3002
+_BODY_NOISE_CHARS = dict.fromkeys(map(ord, "\ufeff\u200b\u2060"), None)
+_EDGE_INVISIBLE_CHARS = "\ufeff\u200b\u200c\u200d\u2060"
+_MARKDOWN_WRAP_CHARS = "*_`"
+_CORRECTION_LINE_RE = re.compile(
+    r"^([*_`]*)[ \t\u3000]*(\d+)[ \t\u3000]*[*_`]*[ \t\u3000]*[|\uff5c](.*)$", re.ASCII
+)
+
+
 def parse_correction_response(text: str, expected_indexes: set[int]) -> dict[int, str]:
+    """Parse ``序号|文本`` lines; ``#12 ...`` context lines and unknown indexes are ignored."""
     mapping: dict[int, str] = {}
-    for line in text.splitlines():
-        if "|" not in line:
+    for raw_line in (text or "").splitlines():
+        separator = re.search(r"[|｜]", raw_line)
+        if not separator:
             continue
-        left, right = line.split("|", 1)
-        left = left.strip()
-        if not left.isdigit():
+        head = raw_line[: separator.start()].translate(_INVISIBLE_CHARS)
+        body = raw_line[separator.start() :].translate(_BODY_NOISE_CHARS)
+        match = _CORRECTION_LINE_RE.match((head + body).strip())
+        if not match:
             continue
-        index = int(left)
-        if index in expected_indexes:
-            mapping[index] = right.strip()
+        wrapper, number, right = match.groups()
+        index = int(number)
+        if index not in expected_indexes:
+            continue
+        right = right.strip().strip(_EDGE_INVISIBLE_CHARS).strip()
+        if wrapper:
+            # **12|文本** / `12|文本`：去掉与行首对应的 Markdown 包裹。
+            right = right.rstrip(_MARKDOWN_WRAP_CHARS).strip()
+        mapping[index] = right
     return mapping
 
 
@@ -2281,13 +2736,24 @@ def missing_correction_indexes(mapping: dict[int, str], expected_indexes: set[in
     return sorted(expected_indexes - set(mapping))
 
 
+def compact_for_length_check(text: str) -> str:
+    return "".join(ch for ch in text if not ch.isspace() and not is_punctuation(ch))
+
+
+def mostly_cjk(text: str) -> bool:
+    letters = [ch for ch in text if ch.isalnum()]
+    if not letters:
+        return False
+    return sum(1 for ch in letters if is_cjk(ch)) * 2 >= len(letters)
+
+
 def correction_text_issue(original: str, corrected: str) -> str:
     original = original.strip()
     corrected = corrected.strip()
     if not corrected:
-        return "返回文本为空"
-    original_compact = re.sub(r"\s+", "", original)
-    corrected_compact = re.sub(r"\s+", "", corrected)
+        return "" if not original else "返回文本为空"
+    original_compact = compact_for_length_check(original)
+    corrected_compact = compact_for_length_check(corrected)
     if len(original_compact) >= 8:
         ratio = len(corrected_compact) / max(1, len(original_compact))
         if ratio < 0.55:
@@ -2295,6 +2761,9 @@ def correction_text_issue(original: str, corrected: str) -> str:
         if ratio > 1.80:
             return f"长度达到原文的 {ratio:.0%}"
 
+    if mostly_cjk(original):
+        # 中日韩文本没有可靠的空格分词，删改空格会让 \w+ 词数剧烈变化，只看长度比例。
+        return ""
     original_words = re.findall(r"\w+", original, flags=re.UNICODE)
     corrected_words = re.findall(r"\w+", corrected, flags=re.UNICODE)
     if len(original_words) >= 4 and len(corrected_words) < max(2, int(len(original_words) * 0.5)):
@@ -2320,6 +2789,256 @@ def completion_finish_reason_is_valid(finish_reason: str) -> bool:
     return normalized in {"", "stop", "completed", "complete", "end_turn"}
 
 
+AI_CONTEXT_LINES = 5
+AI_LOW_CONFIDENCE_THRESHOLD = 0.5
+AI_LOW_CONFIDENCE_MAX_WORDS = 6
+AI_PREPASS_CHUNK_CHARS = 20000
+AI_GLOSSARY_MAX_LINES = 60
+
+AI_PREPASS_SYSTEM_PROMPT = """你是字幕校对前的预读助手。系统会给出一段 ASR 语音识别出的全文（可能有错别字、专有名词拼错）。
+请通读全文，只输出以下格式，不要输出任何其他内容：
+
+主题: <一句话说明内容主题和领域>
+术语:
+- <正确写法> | <文中出现的疑似误识别写法，多个用逗号分隔；没有则留空>
+
+要求：
+1. 术语只列人名、地名、机构、品牌、作品名、专业术语等专有名词，最多 40 条，按重要程度排序。
+2. 根据上下文和常识推断正确写法；拿不准的不要列。
+3. 保持原语言，不要翻译。
+4. 没有值得列出的术语时，“术语:”下面写“- 无”。"""
+
+
+def language_display(code: str) -> str:
+    code = (code or "").strip()
+    if not code or code in {"auto", "unknown"}:
+        return ""
+    label = CODE_TO_LANGUAGE.get(code)
+    return f"{label}（{code}）" if label else code
+
+
+def normalize_glossary_word(value: str) -> str:
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", value or "").casefold())
+
+
+def low_confidence_words_by_subtitle(
+    subtitles: list[Subtitle],
+    segments: list[object],
+    threshold: float = AI_LOW_CONFIDENCE_THRESHOLD,
+    max_words: int = AI_LOW_CONFIDENCE_MAX_WORDS,
+) -> dict[int, list[str]]:
+    """Map subtitle index -> ASR words with low probability that still appear in its text."""
+    import bisect
+
+    ordered = sorted(subtitles, key=lambda sub: sub.start)
+    starts = [sub.start for sub in ordered]
+    result: dict[int, list[str]] = {}
+    for segment in segments:
+        for word in getattr(segment, "words", None) or []:
+            probability = getattr(word, "probability", None)
+            text = str(getattr(word, "word", "") or "").strip()
+            if probability is None or not text or float(probability) >= threshold:
+                continue
+            key = normalize_glossary_word(text)
+            if not key:
+                continue
+            start = float(getattr(word, "start", 0.0) or 0.0)
+            end = float(getattr(word, "end", start) or start)
+            middle = (start + end) / 2
+            position = bisect.bisect_right(starts, middle + 0.15)
+            for candidate in ordered[max(0, position - 3) : position]:
+                if not (candidate.start - 0.15 <= middle <= candidate.end + 0.15):
+                    continue
+                if key not in normalize_glossary_word(candidate.text):
+                    continue
+                words = result.setdefault(candidate.index, [])
+                if text not in words and len(words) < max_words:
+                    words.append(text)
+                break
+    return result
+
+
+def parse_prepass_response(text: str) -> tuple[str, list[str]]:
+    topic = ""
+    terms: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not topic and re.match(r"^主题\s*[:：]", line):
+            topic = re.split(r"[:：]", line, 1)[1].strip()
+            continue
+        if line.startswith(("-", "*", "•")):
+            term = line.lstrip("-*• ").strip()
+            if term and term.strip("|｜ ") not in {"无", "none", "None"}:
+                terms.append(term)
+    return topic, terms
+
+
+def build_ai_guidance(
+    subtitles: list[Subtitle],
+    base_url: str,
+    api_key: str,
+    model: str,
+    log,
+    *,
+    language: str = "",
+    user_glossary: str = "",
+    segments: list[object] | None = None,
+) -> AIGuidance:
+    """Read the whole transcript once to collect topic and glossary before batch correction."""
+    guidance = AIGuidance(
+        language=language_display(language),
+        user_glossary=(user_glossary or "").strip(),
+    )
+    if segments:
+        guidance.low_confidence = low_confidence_words_by_subtitle(subtitles, segments)
+        if guidance.low_confidence:
+            count = sum(len(words) for words in guidance.low_confidence.values())
+            log(f"ASR 低置信度词: {count} 个，分布在 {len(guidance.low_confidence)} 条字幕，将提示 AI 重点检查。")
+
+    full_text = "\n".join(sub.text for sub in subtitles if sub.text.strip())
+    if not full_text.strip():
+        return guidance
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in full_text.splitlines():
+        if current and current_len + len(line) > AI_PREPASS_CHUNK_CHARS:
+            chunks.append("\n".join(current))
+            current, current_len = [], 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+
+    topics: list[str] = []
+    terms: list[str] = []
+    seen: set[str] = set()
+    for number, chunk in enumerate(chunks, start=1):
+        check_cancelled()
+        header = []
+        if guidance.language:
+            header.append(f"语言: {guidance.language}")
+        if guidance.user_glossary:
+            header.append("用户已提供的术语（以此为准，可不重复列出）:\n" + guidance.user_glossary)
+        part = f"（第 {number}/{len(chunks)} 段）" if len(chunks) > 1 else ""
+        user_content = "\n".join(header + [f"ASR 全文{part}:", chunk])
+        try:
+            log(f"AI 全文预读，提取主题和术语{part} ...")
+            completion = call_openai_compatible(
+                base_url, api_key, model, AI_PREPASS_SYSTEM_PROMPT, user_content
+            )
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            log(f"AI 全文预读失败，跳过术语提取，继续逐批校对: {exc}")
+            break
+        content = completion.content if isinstance(completion, AICompletion) else str(completion)
+        topic, chunk_terms = parse_prepass_response(content)
+        if topic:
+            topics.append(topic)
+        for term in chunk_terms:
+            key = normalize_glossary_word(term.split("|")[0])
+            if key and key not in seen:
+                seen.add(key)
+                terms.append(term)
+
+    guidance.topic = topics[0] if topics else ""
+    guidance.glossary = "\n".join(f"- {term}" for term in terms[:AI_GLOSSARY_MAX_LINES])
+    if guidance.topic or terms:
+        log(f"AI 预读完成: 主题“{guidance.topic or '未识别'}”，术语 {min(len(terms), AI_GLOSSARY_MAX_LINES)} 条。")
+    return guidance
+
+
+def build_correction_user_content(
+    batch: list[Subtitle],
+    completion_marker: str,
+    guidance: AIGuidance | None = None,
+    all_subtitles: list[Subtitle] | None = None,
+    context_lines: int = AI_CONTEXT_LINES,
+) -> str:
+    sections: list[str] = []
+    reference: list[str] = []
+    if guidance:
+        if guidance.language:
+            reference.append(f"语言: {guidance.language}，保持该语言输出，不要翻译。")
+        if guidance.topic:
+            reference.append(f"主题: {guidance.topic}")
+        if guidance.user_glossary:
+            reference.append("用户术语表（最高优先级）:\n" + guidance.user_glossary)
+        if guidance.glossary:
+            reference.append("全文术语表（格式: 正确写法 | 疑似误识别写法）:\n" + guidance.glossary)
+    if reference:
+        sections.append("【参考信息】\n" + "\n".join(reference))
+
+    before: list[Subtitle] = []
+    after: list[Subtitle] = []
+    if all_subtitles and context_lines > 0:
+        positions = {sub.index: position for position, sub in enumerate(all_subtitles)}
+        first = positions.get(batch[0].index)
+        last = positions.get(batch[-1].index)
+        if first is not None and last is not None:
+            before = all_subtitles[max(0, first - context_lines) : first]
+            after = all_subtitles[last + 1 : last + 1 + context_lines]
+    if before:
+        sections.append("【前文】（仅供理解，不要输出）\n" + "\n".join(f"#{sub.index} {sub.text}" for sub in before))
+    sections.append("【待校对条目】（只输出这些）\n" + "\n".join(f"{sub.index}|{sub.text}" for sub in batch))
+    if after:
+        sections.append("【后文】（仅供理解，不要输出）\n" + "\n".join(f"#{sub.index} {sub.text}" for sub in after))
+
+    if guidance and guidance.low_confidence:
+        hints = [
+            f"{sub.index}: {'、'.join(guidance.low_confidence[sub.index])}"
+            for sub in batch
+            if guidance.low_confidence.get(sub.index)
+        ]
+        if hints:
+            sections.append(
+                "【重点检查】以下是 ASR 置信度较低、最可能识别错的词；其余内容除非明显错误否则不改。\n"
+                + "\n".join(hints)
+            )
+
+    if len(sections) == 1:
+        entries = "\n".join(f"{sub.index}|{sub.text}" for sub in batch)
+    else:
+        entries = "\n\n".join(sections)
+    return (
+        f"{entries}\n\n"
+        "完成全部条目后，必须在最后单独一行原样输出以下完成标记：\n"
+        f"{completion_marker}"
+    )
+
+
+AI_RETRY_MAX_DELAY = 16
+
+
+class AIBatchAborted(RuntimeError):
+    """A parallel AI batch stopped early because another batch already failed."""
+
+
+def raise_if_ai_batch_stopped(stop_event: threading.Event | None) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise AIBatchAborted("其他 AI 校对批次已失败，本批次提前停止。")
+
+
+def wait_before_ai_retry(seconds: float, stop_event: threading.Event | None = None) -> None:
+    """Retry backoff that wakes immediately on task cancel or when a sibling batch failed."""
+    if sleep_cancellable(seconds, stop_event):
+        raise_if_ai_batch_stopped(stop_event)
+
+
+def ai_request_error_hint(exc: AIRequestError) -> str:
+    status = exc.status_code
+    if status in (401, 403):
+        return "API Key 无效、已过期或无权访问该模型"
+    if status == 404:
+        return "Base URL 或模型名不存在"
+    if status == 400:
+        return "请求被服务端拒绝，请检查模型名和参数"
+    if status is not None:
+        return f"HTTP {status}"
+    return "请求被拒绝"
+
+
 def correct_ai_batch_strict(
     batch: list[Subtitle],
     base_url: str,
@@ -2328,20 +3047,33 @@ def correct_ai_batch_strict(
     system_prompt: str,
     log,
     attempts: int = 5,
+    guidance: AIGuidance | None = None,
+    all_subtitles: list[Subtitle] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict[int, str]:
     expected = {sub.index for sub in batch}
     completion_marker = f"__SRTMATCHER_COMPLETE_{batch[0].index}_{batch[-1].index}__"
-    entries = "\n".join(f"{sub.index}|{sub.text}" for sub in batch)
-    user_content = (
-        f"{entries}\n\n"
-        "完成全部条目后，必须在最后单独一行原样输出以下完成标记：\n"
-        f"{completion_marker}"
-    )
+    user_content = build_correction_user_content(batch, completion_marker, guidance, all_subtitles)
 
     for attempt in range(1, attempts + 1):
         check_cancelled()
+        raise_if_ai_batch_stopped(stop_event)
         log(f"AI 校对字幕 {batch[0].index}-{batch[-1].index}，第 {attempt} 次 ...")
-        completion = call_openai_compatible(base_url, api_key, model, system_prompt, user_content)
+        try:
+            completion = call_openai_compatible(base_url, api_key, model, system_prompt, user_content)
+        except TaskCancelled:
+            raise
+        except AIRequestError as exc:
+            if not exc.retryable:
+                raise RuntimeError(
+                    f"AI 请求失败且不可重试（{ai_request_error_hint(exc)}）：{exc}"
+                ) from exc
+            if attempt >= attempts:
+                raise RuntimeError(f"AI 请求连续 {attempts} 次临时失败，已停止：{exc}") from exc
+            delay = min(2 ** attempt, AI_RETRY_MAX_DELAY)
+            log(f"AI 请求临时失败（{exc}），{delay} 秒后重试 ...")
+            wait_before_ai_retry(delay, stop_event)
+            continue
         if isinstance(completion, str):
             completion = AICompletion(completion)
         mapping = parse_correction_response(completion.content, expected)
@@ -2382,14 +3114,20 @@ def correct_ai_batch_strict(
                 preview += " ..."
             issues.append(f"疑似截断/改写 {len(invalid)} 条: {preview}")
         log("AI 自检未通过：" + "；".join(issues) + "，准备重试。")
-        time.sleep(min(1 + attempt, 5))
+        wait_before_ai_retry(min(1 + attempt, 5), stop_event)
         check_cancelled()
 
     if len(batch) > 1:
         mid = len(batch) // 2
         log(f"批次 {batch[0].index}-{batch[-1].index} 多次失败，拆成更小批次重试。")
-        left = correct_ai_batch_strict(batch[:mid], base_url, api_key, model, system_prompt, log, attempts)
-        right = correct_ai_batch_strict(batch[mid:], base_url, api_key, model, system_prompt, log, attempts)
+        left = correct_ai_batch_strict(
+            batch[:mid], base_url, api_key, model, system_prompt, log, attempts, guidance, all_subtitles,
+            stop_event=stop_event,
+        )
+        right = correct_ai_batch_strict(
+            batch[mid:], base_url, api_key, model, system_prompt, log, attempts, guidance, all_subtitles,
+            stop_event=stop_event,
+        )
         return {**left, **right}
 
     raise RuntimeError(
@@ -2406,10 +3144,13 @@ def correct_subtitles_with_ai(
     log,
     batch_size: int = 20,
     parallelism: int = 2,
+    guidance: AIGuidance | None = None,
 ) -> list[Subtitle]:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    system_prompt = resolve_system_prompt(system_prompt)
     corrected = list(subtitles)
+    original = list(subtitles)
     batches = [
         corrected[start : start + batch_size]
         for start in range(0, len(corrected), batch_size)
@@ -2418,11 +3159,13 @@ def correct_subtitles_with_ai(
         return corrected
 
     token = current_cancellation_token()
+    stop_event = threading.Event()
 
-    def correct_one(batch: list[Subtitle]) -> dict[int, str]:
+    def correct_one(batch: list[Subtitle], batch_stop: threading.Event | None = None) -> dict[int, str]:
         with task_context(token):
             return correct_ai_batch_strict(
-                batch, base_url, api_key, model, system_prompt, log
+                batch, base_url, api_key, model, system_prompt, log,
+                guidance=guidance, all_subtitles=original, stop_event=batch_stop,
             )
 
     mappings: dict[int, dict[int, str]] = {}
@@ -2433,11 +3176,20 @@ def correct_subtitles_with_ai(
             mappings[index] = correct_one(batch)
     else:
         log(f"AI 校对启用 {worker_count} 个受控并发请求。")
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="srt-ai") as pool:
-            futures = {pool.submit(correct_one, batch): index for index, batch in enumerate(batches)}
+        pool = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="srt-ai")
+        futures = {
+            pool.submit(correct_one, batch, stop_event): index for index, batch in enumerate(batches)
+        }
+        try:
             for future in as_completed(futures):
                 check_cancelled()
                 mappings[futures[future]] = future.result()
+        except BaseException:
+            # 任一批次失败/取消：取消排队中的批次，通知进行中的批次尽快停止，再抛出原始错误。
+            stop_event.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
 
     for index in range(len(batches)):
         corrected = replace_subtitle_texts(corrected, mappings[index])

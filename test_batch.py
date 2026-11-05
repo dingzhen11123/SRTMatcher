@@ -28,7 +28,7 @@ class FakeWhisperModel:
         return iter(segments), SimpleNamespace(language=language)
 
 
-def fake_corrector(subtitles, base_url, api_key, model, system_prompt, log):
+def fake_corrector(subtitles, base_url, api_key, model, system_prompt, log, **_kwargs):
     return [
         app.Subtitle(sub.index, sub.start, sub.end, f"{sub.text} [corrected]", sub.speaker)
         for sub in subtitles
@@ -73,6 +73,7 @@ class BatchTxtTests(unittest.TestCase):
                 patch.object(app, "prepare_model_files", return_value=str(model_dir)),
                 patch.object(app, "add_cuda_dll_paths"),
                 patch.object(app, "correct_subtitles_with_ai", side_effect=fake_corrector),
+                patch.object(app, "build_ai_guidance", return_value=app.AIGuidance()),
             ):
                 result = app.run_batch_txt_job(
                     config, logs.append, lambda value, message: progress.append((value, message))
